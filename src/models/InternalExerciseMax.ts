@@ -1,12 +1,14 @@
 import mongoose, { Schema, Document } from 'mongoose';
 
-/** TM derivado del rendimiento en ejercicios sin vínculo oficial (mismo nombre exacto / normalizado). */
+/** TM derivado del rendimiento en ejercicios sin vínculo oficial; por rutina (no global al usuario). */
 export interface IInternalExerciseMax extends Document {
   userId: mongoose.Types.ObjectId;
+  /** Rutina cuyo plan define el ejercicio (mismos nombres en otra rutina = otro registro). */
+  routineId: mongoose.Types.ObjectId;
   /** Nombre tal como en la rutina (primera vez que se registró). */
   name: string;
   nameNormalized: string;
-  /** E1RM (kg) redondeado a 2,5 — ejercicios modo peso. */
+  /** Mejor peso de serie registrado (kg), redondeado a 2,5 — referencia al 100 % en modo peso (no e1RM estimado). */
   valueWeight?: number;
   /** Mejor marca en repeticiones — modo reps. */
   valueReps?: number;
@@ -23,6 +25,12 @@ const InternalExerciseMaxSchema = new Schema<IInternalExerciseMax>(
     userId: {
       type: Schema.Types.ObjectId,
       ref: 'User',
+      required: true,
+      index: true,
+    },
+    routineId: {
+      type: Schema.Types.ObjectId,
+      ref: 'Routine',
       required: true,
       index: true,
     },
@@ -48,7 +56,7 @@ const InternalExerciseMaxSchema = new Schema<IInternalExerciseMax>(
   }
 );
 
-InternalExerciseMaxSchema.index({ userId: 1, nameNormalized: 1 }, { unique: true });
+InternalExerciseMaxSchema.index({ userId: 1, routineId: 1, nameNormalized: 1 }, { unique: true });
 
 export const InternalExerciseMax = mongoose.model<IInternalExerciseMax>(
   'InternalExerciseMax',

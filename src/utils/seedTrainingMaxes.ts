@@ -19,7 +19,7 @@ export async function seedTrainingMaxesForRoutine(
   userId: mongoose.Types.ObjectId,
   routineId: mongoose.Types.ObjectId
 ) {
-  const existing = await TrainingMax.countDocuments({ routineId });
+  const existing = await TrainingMax.countDocuments({ userId, routineId });
   if (existing > 0) return;
   for (const d of DEFAULT_TRAINING_MAXES) {
     await TrainingMax.create({

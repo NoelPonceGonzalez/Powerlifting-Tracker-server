@@ -3,11 +3,39 @@ import mongoose from 'mongoose';
 import { authenticateToken } from '../middleware/auth';
 import { Routine } from '../models/Routine';
 import { TrainingMax } from '../models/TrainingMax';
+import { HistoryEntry } from '../models/HistoryEntry';
 import { body, validationResult } from 'express-validator';
 import { seedTrainingMaxesForRoutine } from '../utils/seedTrainingMaxes';
 
 const router = express.Router();
 const TOTAL_WEEKS = 52;
+
+/** JSON plano → Map de Mongoose para `logs` (persistencia fiable). Normaliza cada entrada al esquema. */
+function logsBodyToMap(logs: unknown): Map<string, any> {
+  const m = new Map<string, any>();
+  if (logs && typeof logs === 'object' && !Array.isArray(logs)) {
+    for (const [k, v] of Object.entries(logs as Record<string, any>)) {
+      if (!v || typeof v !== 'object' || Array.isArray(v)) continue;
+      const sets = Array.isArray(v.sets)
+        ? v.sets.map((s: any) => ({
+            id: s?.id != null ? String(s.id) : '0',
+            reps: s?.reps != null && s.reps !== '' ? s.reps : null,
+            weight: s?.weight != null && s.weight !== '' ? s.weight : null,
+            completed: !!s?.completed,
+            ...(s?.inputMode === 'kg' || s?.inputMode === 'pct' ? { inputMode: s.inputMode } : {}),
+          }))
+        : [];
+      m.set(k, {
+        rpe: v.rpe != null ? String(v.rpe) : '',
+        notes: v.notes != null ? String(v.notes) : '',
+        completed: !!v.completed,
+        ...(v.weight != null && Number.isFinite(Number(v.weight)) ? { weight: Number(v.weight) } : {}),
+        sets,
+      });
+    }
+  }
+  return m;
+}
 
 const getWeekType = (weekNumber: number): number => ((Math.max(1, weekNumber) - 1) % 4) + 1;
 
@@ -249,7 +277,9 @@ router.put(
       routine.baseTemplate = nextBaseTemplate;
       routine.weekTypeOverrides = nextOverrides;
 
-      if (logs !== undefined) routine.logs = logs;
+      if (logs !== undefined) {
+        (routine as any).logs = logsBodyToMap(logs);
+      }
       
       // Si se marca como activa, desactivar las demás
       if (isActive === true) {
@@ -275,7 +305,9 @@ router.delete('/:id', authenticateToken, async (req: Request, res: Response) => 
     if (!routine) {
       return res.status(404).json({ error: 'Rutina no encontrada' });
     }
-    await TrainingMax.deleteMany({ routineId: req.params.id, userId });
+    const rid = routine._id;
+    await TrainingMax.deleteMany({ userId, routineId: rid });
+    await HistoryEntry.deleteMany({ userId, routineId: rid });
     res.json({ message: 'Rutina eliminada' });
   } catch (error: any) {
     res.status(500).json({ error: error.message });

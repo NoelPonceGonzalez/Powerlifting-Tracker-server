@@ -361,6 +361,35 @@ router.put(
 
       await challenge.save();
 
+      // Notificar al creador cuando un amigo se une (no si el creador actualiza su propia marca)
+      if (!isCreator) {
+        const joinerName = user?.name || user?.email || 'Alguien';
+        try {
+          const notif = new Notification({
+            userId: creatorId,
+            type: 'challenge_join',
+            title: `${joinerName} se ha unido a tu torneo`,
+            message: `"${challenge.title}" (${challenge.exercise})`,
+            relatedUserId: userId,
+            relatedData: { challengeId: challenge._id.toString() },
+          });
+          await notif.save();
+          const { sendPushToUser } = await import('../utils/push');
+          await sendPushToUser(
+            creatorId,
+            `${joinerName} se ha unido a tu torneo`,
+            `"${challenge.title}" (${challenge.exercise})`,
+            {
+              type: 'challenge_join',
+              challengeId: challenge._id.toString(),
+              relatedUserId: String(userId),
+            }
+          );
+        } catch (e) {
+          console.error('[PUSH] Error challenge_join:', e);
+        }
+      }
+
       const updated = await Challenge.findById(challenge._id)
         .populate('createdBy', 'name email avatar')
         .populate('participants.userId', 'name email avatar bodyWeight gender');

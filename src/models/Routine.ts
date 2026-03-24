@@ -45,6 +45,8 @@ export interface ILogEntry {
     reps: number | null;
     weight: number | null;
     completed: boolean;
+    /** 'kg' | absoluto; 'pct' | % sobre referencia/TM al guardar la serie. */
+    inputMode?: 'kg' | 'pct';
   }>;
 }
 
@@ -108,6 +110,7 @@ const LogEntrySchema = new Schema<ILogEntry>({
     reps: Schema.Types.Mixed,
     weight: Schema.Types.Mixed,
     completed: Boolean,
+    inputMode: { type: String, enum: ['kg', 'pct'] },
   }],
 }, { _id: false });
 

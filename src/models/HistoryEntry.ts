@@ -7,6 +7,8 @@ export interface IHistoryEntry extends Document {
   date: string; // Formato: 'Ene', 'Feb', etc. (para mostrar)
   week?: number; // Semana 1-52 para ordenar por tramos
   year?: number; // Año para ordenar por tramos
+  /** 0=lun … 6=dom; ausente = snapshot semanal sin día concreto */
+  dayIndex?: number;
   rms: {
     bench: number;
     squat: number;
@@ -15,6 +17,8 @@ export interface IHistoryEntry extends Document {
   };
   total: number;
   trainingMaxes: Record<string, number>; // TM ID -> value
+  /** Cómo se agregó `total` en el cliente (peso / reps / seg / mixto). */
+  progressKind?: 'weight' | 'reps' | 'seconds' | 'mixed';
   createdAt: Date;
 }
 
@@ -37,6 +41,7 @@ const HistoryEntrySchema = new Schema<IHistoryEntry>(
     },
     week: { type: Number },
     year: { type: Number },
+    dayIndex: { type: Number, min: 0, max: 6 },
     rms: {
       type: Schema.Types.Mixed,
       required: true,
@@ -48,6 +53,10 @@ const HistoryEntrySchema = new Schema<IHistoryEntry>(
     trainingMaxes: {
       type: Schema.Types.Mixed,
       default: {},
+    },
+    progressKind: {
+      type: String,
+      enum: ['weight', 'reps', 'seconds', 'mixed'],
     },
   },
   {

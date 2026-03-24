@@ -1,5 +1,5 @@
 import express, { Request, Response } from 'express';
-import { authenticateToken } from '../middleware/auth';
+import { authenticateToken, AuthRequest } from '../middleware/auth';
 import { Notification } from '../models/Notification';
 import { User } from '../models/User';
 import { Friendship } from '../models/Friendship';
@@ -19,7 +19,7 @@ router.put(
       if (!errors.isEmpty()) {
         return res.status(400).json({ errors: errors.array() });
       }
-      const userId = (req as any).userId || (req as any).user?.userId;
+      const userId = (req as AuthRequest).userId || (req as any).user?.userId;
       if (!userId) return res.status(401).json({ error: 'Usuario no autenticado' });
       const { token } = req.body;
       await User.findByIdAndUpdate(userId, { pushToken: token });

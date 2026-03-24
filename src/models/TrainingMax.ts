@@ -2,7 +2,7 @@ import mongoose, { Schema, Document } from 'mongoose';
 
 export interface ITrainingMax extends Document {
   userId: mongoose.Types.ObjectId;
-  /** Rutina a la que pertenecen estos TM (cada rutina tiene su propio juego). */
+  /** Rutina a la que pertenecen estos TM (cada rutina tiene su propio juego de documentos). */
   routineId: mongoose.Types.ObjectId;
   name: string;
   value: number;
@@ -18,6 +18,13 @@ const TrainingMaxSchema = new Schema<ITrainingMax>(
     userId: {
       type: Schema.Types.ObjectId,
       ref: 'User',
+      required: true,
+      index: true,
+    },
+    /** Siempre ligado a una rutina (no hay TM “solo de usuario”). */
+    routineId: {
+      type: Schema.Types.ObjectId,
+      ref: 'Routine',
       required: true,
       index: true,
     },
@@ -50,6 +57,7 @@ const TrainingMaxSchema = new Schema<ITrainingMax>(
 );
 
 TrainingMaxSchema.index({ userId: 1, routineId: 1 });
-TrainingMaxSchema.index({ userId: 1, linkedExercise: 1 });
+/** Un bench/squat/deadlift por rutina (búsquedas sociales / perfil). */
+TrainingMaxSchema.index({ userId: 1, routineId: 1, linkedExercise: 1 }, { sparse: true });
 
 export const TrainingMax = mongoose.model<ITrainingMax>('TrainingMax', TrainingMaxSchema);

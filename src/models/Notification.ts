@@ -1,6 +1,11 @@
 import mongoose, { Schema, Document } from 'mongoose';
 
-export type NotificationType = 'gym_checkin' | 'friend_request' | 'challenge_invite' | 'friend_accepted';
+export type NotificationType =
+  | 'gym_checkin'
+  | 'friend_request'
+  | 'challenge_invite'
+  | 'challenge_join'
+  | 'friend_accepted';
 
 export interface INotification extends Document {
   userId: mongoose.Types.ObjectId; // Usuario que recibe la notificación
@@ -23,7 +28,13 @@ const NotificationSchema = new Schema<INotification>(
     },
     type: {
       type: String,
-      enum: ['gym_checkin', 'friend_request', 'challenge_invite', 'friend_accepted'],
+      enum: [
+        'gym_checkin',
+        'friend_request',
+        'challenge_invite',
+        'challenge_join',
+        'friend_accepted',
+      ],
       required: true,
     },
     title: {

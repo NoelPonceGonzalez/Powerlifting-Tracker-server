@@ -121,11 +121,12 @@ router.post(
   }
 );
 
-// PUT /api/training-maxes/:id - Actualizar un Training Max
+// PUT /api/training-maxes/:id - Actualizar un TM (debe pertenecer a `routineId`; no basta con userId)
 router.put(
   '/:id',
   authenticateToken,
   [
+    body('routineId').isMongoId().withMessage('routineId inválido'),
     body('value').optional().isNumeric().withMessage('El valor debe ser numérico'),
     body('name').optional().trim().notEmpty().withMessage('El nombre no puede estar vacío'),
   ],
@@ -137,11 +138,20 @@ router.put(
       }
 
       const userId = new mongoose.Types.ObjectId((req as any).user.userId);
-      const { name, value, mode, linkedExercise, sharedToSocial } = req.body;
+      const { name, value, mode, linkedExercise, sharedToSocial, routineId } = req.body;
 
-      const trainingMax = await TrainingMax.findOne({ _id: req.params.id, userId });
+      const routine = await assertRoutineOwned(userId, routineId);
+      if (!routine) {
+        return res.status(404).json({ error: 'Rutina no encontrada' });
+      }
+      const rid =
+        routine._id instanceof mongoose.Types.ObjectId
+          ? routine._id
+          : new mongoose.Types.ObjectId(String(routine._id));
+
+      const trainingMax = await TrainingMax.findOne({ _id: req.params.id, userId, routineId: rid });
       if (!trainingMax) {
-        return res.status(404).json({ error: 'Training Max no encontrado' });
+        return res.status(404).json({ error: 'Training Max no encontrado en esta rutina' });
       }
 
       if (name !== undefined) trainingMax.name = name;
@@ -158,19 +168,39 @@ router.put(
   }
 );
 
-// DELETE /api/training-maxes/:id - Eliminar un Training Max
-router.delete('/:id', authenticateToken, async (req: Request, res: Response) => {
-  try {
-    const userId = new mongoose.Types.ObjectId((req as any).user.userId);
-    const trainingMax = await TrainingMax.findOneAndDelete({ _id: req.params.id, userId });
-    if (!trainingMax) {
-      return res.status(404).json({ error: 'Training Max no encontrado' });
+// DELETE /api/training-maxes/:id?routineId= — Eliminar un TM de esa rutina
+router.delete(
+  '/:id',
+  authenticateToken,
+  [query('routineId').isMongoId().withMessage('routineId inválido')],
+  async (req: Request, res: Response) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ errors: errors.array() });
+      }
+
+      const userId = new mongoose.Types.ObjectId((req as any).user.userId);
+      const routineId = String(req.query.routineId);
+      const routine = await assertRoutineOwned(userId, routineId);
+      if (!routine) {
+        return res.status(404).json({ error: 'Rutina no encontrada' });
+      }
+      const rid =
+        routine._id instanceof mongoose.Types.ObjectId
+          ? routine._id
+          : new mongoose.Types.ObjectId(String(routine._id));
+
+      const trainingMax = await TrainingMax.findOneAndDelete({ _id: req.params.id, userId, routineId: rid });
+      if (!trainingMax) {
+        return res.status(404).json({ error: 'Training Max no encontrado en esta rutina' });
+      }
+      res.json({ message: 'Training Max eliminado' });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
     }
-    res.json({ message: 'Training Max eliminado' });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
   }
-});
+);
 
 // POST /api/training-maxes/save-period - Guardar el período actual (historial mensual, por rutina)
 router.post(
@@ -191,7 +221,7 @@ router.post(
       }
 
       const userId = new mongoose.Types.ObjectId((req as any).user.userId);
-      const { date, week, year, rms, total, trainingMaxes, routineId } = req.body;
+      const { date, week, year, rms, total, trainingMaxes, routineId, progressKind, dayIndex } = req.body;
 
       const routine = await assertRoutineOwned(userId, routineId);
       if (!routine) {
@@ -203,6 +233,11 @@ router.post(
       if (week != null && year != null) {
         query.year = Number(year);
         query.week = Number(week);
+        if (dayIndex != null && dayIndex !== '') {
+          query.dayIndex = Number(dayIndex);
+        } else {
+          query.$or = [{ dayIndex: { $exists: false } }, { dayIndex: null }];
+        }
       } else {
         query.date = date;
       }
@@ -212,8 +247,10 @@ router.post(
         existing.rms = rms;
         existing.total = total;
         existing.trainingMaxes = trainingMaxes;
+        if (progressKind !== undefined) (existing as any).progressKind = progressKind;
         if (week !== undefined) existing.week = Number(week);
         if (year !== undefined) existing.year = Number(year);
+        if (dayIndex != null && dayIndex !== '') (existing as any).dayIndex = Number(dayIndex);
         existing.routineId = rid;
         await existing.save();
         res.json(existing);
@@ -224,9 +261,11 @@ router.post(
           date,
           week: week != null ? Number(week) : undefined,
           year: year != null ? Number(year) : undefined,
+          ...(dayIndex != null && dayIndex !== '' ? { dayIndex: Number(dayIndex) } : {}),
           rms,
           total,
           trainingMaxes,
+          ...(progressKind ? { progressKind } : {}),
         });
         await historyEntry.save();
         res.status(201).json(historyEntry);
@@ -259,7 +298,20 @@ router.get(
       }
       const rid = routine._id instanceof mongoose.Types.ObjectId ? routine._id : new mongoose.Types.ObjectId(String(routine._id));
 
-      const history = await HistoryEntry.find({ userId, routineId: rid }).sort({ year: 1, week: 1, createdAt: 1 });
+      const history = await HistoryEntry.find({ userId, routineId: rid }).lean();
+      (history as any[]).sort((a, b) => {
+        const ya = (a.year ?? 0) - (b.year ?? 0);
+        if (ya !== 0) return ya;
+        const wa = (a.week ?? 0) - (b.week ?? 0);
+        if (wa !== 0) return wa;
+        const da = a.dayIndex,
+          db = b.dayIndex;
+        if (da == null && db == null) return String(a._id).localeCompare(String(b._id));
+        if (da == null) return 1;
+        if (db == null) return -1;
+        if (da !== db) return da - db;
+        return String(a._id).localeCompare(String(b._id));
+      });
       res.json(history);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
