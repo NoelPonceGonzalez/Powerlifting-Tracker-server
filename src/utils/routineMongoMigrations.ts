@@ -4,7 +4,11 @@ import { TrainingMax } from '../models/TrainingMax';
 import { HistoryEntry } from '../models/HistoryEntry';
 import { InternalExerciseMax } from '../models/InternalExerciseMax';
 import { logger } from './logger';
-import { seedTrainingMaxesForRoutine } from './seedTrainingMaxes';
+import {
+  migrateRoutineEmbeddedLogsToExerciseLogs,
+  migrateUnsetRoutineTopLevelWeeks,
+} from './migrateExerciseLogs';
+import { runNormalizedMigration } from './migrateToNormalized';
 
 /**
  * Migraciones idempotentes al arranque: datos legados coherentes con rutina ↔ TM ↔ historial.
@@ -15,8 +19,10 @@ export async function runRoutineMongoMigrations(): Promise<void> {
     await migrateOrphanTrainingMaxes();
     await migrateOrphanInternalExerciseMaxes();
     await migrateOrphanHistoryEntries();
-    await seedTrainingMaxesWhereRoutineHasNone();
     await normalizeActiveRoutineFlags();
+    await migrateRoutineEmbeddedLogsToExerciseLogs();
+    await migrateUnsetRoutineTopLevelWeeks();
+    await runNormalizedMigration();
   } catch (e: unknown) {
     logger.error('runRoutineMongoMigrations', e instanceof Error ? e.message : e);
   }
@@ -47,27 +53,6 @@ async function migrateOrphanTrainingMaxes(): Promise<void> {
       logger.info(
         `[migration] TM: usuario ${uid} → rutina ${fallback._id} (${res.modifiedCount} docs)`
       );
-    }
-  }
-}
-
-/**
- * Cada rutina debe tener su propio juego de TM en colección `trainingmaxes`.
- * Tras asignar huérfanos a una rutina, las demás rutinas del usuario pueden quedar vacías: se siembran los por defecto.
- */
-async function seedTrainingMaxesWhereRoutineHasNone(): Promise<void> {
-  const routines = await Routine.find({}).select('_id userId').lean();
-  for (const r of routines) {
-    const uid =
-      r.userId instanceof mongoose.Types.ObjectId
-        ? r.userId
-        : new mongoose.Types.ObjectId(String(r.userId));
-    const rid =
-      r._id instanceof mongoose.Types.ObjectId ? r._id : new mongoose.Types.ObjectId(String(r._id));
-    const n = await TrainingMax.countDocuments({ userId: uid, routineId: rid });
-    if (n === 0) {
-      await seedTrainingMaxesForRoutine(uid, rid);
-      logger.info(`[migration] TM por defecto para rutina sin documentos: ${rid}`);
     }
   }
 }

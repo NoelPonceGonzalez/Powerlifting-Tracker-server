@@ -5,9 +5,21 @@ import { TrainingMax } from '../models/TrainingMax';
 import { Routine } from '../models/Routine';
 import { HistoryEntry } from '../models/HistoryEntry';
 import { body, query, validationResult } from 'express-validator';
-import { seedTrainingMaxesForRoutine } from '../utils/seedTrainingMaxes';
+import { calendarMonth1FromDateISO, dateISOFromYearWeekDay } from '../utils/calendarWeekDate';
+import { HistoryTmSnapshot } from '../models/HistoryTmSnapshot';
+import { saveHistoryTmSnapshots, loadHistoryTmSnapshotsAsRecord } from '../utils/assembleRoutine';
 
 const router = express.Router();
+
+/** Fecha enviada por el cliente (día del plan en Rutina); rechaza futuro absurdo. */
+function parseOptionalClientDate(raw: unknown): Date | null {
+  if (raw == null || typeof raw !== 'string' || !raw.trim()) return null;
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return null;
+  const maxFuture = Date.now() + 48 * 60 * 60 * 1000;
+  if (d.getTime() > maxFuture) return null;
+  return d;
+}
 
 /** Asigna TM antiguos (sin rutina) a la rutina activa del usuario — migración única. */
 async function migrateLegacyTrainingMaxes(userId: mongoose.Types.ObjectId) {
@@ -66,11 +78,7 @@ router.get(
       }
 
       const rid = routine._id instanceof mongoose.Types.ObjectId ? routine._id : new mongoose.Types.ObjectId(String(routine._id));
-      let trainingMaxes = await TrainingMax.find({ userId, routineId: rid }).sort({ createdAt: 1 });
-      if (trainingMaxes.length === 0) {
-        await seedTrainingMaxesForRoutine(userId, rid);
-        trainingMaxes = await TrainingMax.find({ userId, routineId: rid }).sort({ createdAt: 1 });
-      }
+      const trainingMaxes = await TrainingMax.find({ userId, routineId: rid }).sort({ createdAt: 1 });
       res.json(trainingMaxes);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -112,9 +120,16 @@ router.post(
         linkedExercise,
         sharedToSocial: !!sharedToSocial,
       });
-
       await trainingMax.save();
-      res.status(201).json(trainingMax);
+      const createdAtClient = parseOptionalClientDate(req.body.createdAt);
+      if (createdAtClient) {
+        await TrainingMax.collection.updateOne(
+          { _id: trainingMax._id },
+          { $set: { createdAt: createdAtClient, updatedAt: createdAtClient } }
+        );
+      }
+      const out = await TrainingMax.findById(trainingMax._id);
+      res.status(201).json(out ?? trainingMax);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }
@@ -154,14 +169,25 @@ router.put(
         return res.status(404).json({ error: 'Training Max no encontrado en esta rutina' });
       }
 
-      if (name !== undefined) trainingMax.name = name;
-      if (value !== undefined) trainingMax.value = value;
-      if (mode !== undefined) trainingMax.mode = mode;
-      if (linkedExercise !== undefined) trainingMax.linkedExercise = linkedExercise;
-      if (sharedToSocial !== undefined) (trainingMax as any).sharedToSocial = !!sharedToSocial;
+      const $set: Record<string, unknown> = {};
+      if (name !== undefined) $set.name = name;
+      if (value !== undefined) $set.value = value;
+      if (mode !== undefined) $set.mode = mode;
+      if (linkedExercise !== undefined) $set.linkedExercise = linkedExercise;
+      if (sharedToSocial !== undefined) $set.sharedToSocial = !!sharedToSocial;
 
-      await trainingMax.save();
-      res.json(trainingMax);
+      const updatedAtClient = parseOptionalClientDate(req.body.updatedAt);
+      $set.updatedAt = updatedAtClient ?? new Date();
+
+      const updated = await TrainingMax.findOneAndUpdate(
+        { _id: req.params.id, userId, routineId: rid },
+        { $set },
+        { new: true, runValidators: true, timestamps: false }
+      );
+      if (!updated) {
+        return res.status(404).json({ error: 'Training Max no encontrado en esta rutina' });
+      }
+      res.json(updated);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }
@@ -195,6 +221,7 @@ router.delete(
       if (!trainingMax) {
         return res.status(404).json({ error: 'Training Max no encontrado en esta rutina' });
       }
+      await HistoryTmSnapshot.deleteMany({ trainingMaxId: trainingMax._id });
       res.json({ message: 'Training Max eliminado' });
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -221,7 +248,15 @@ router.post(
       }
 
       const userId = new mongoose.Types.ObjectId((req as any).user.userId);
-      const { date, week, year, rms, total, trainingMaxes, routineId, progressKind, dayIndex } = req.body;
+      const { date, week, year, rms, total, trainingMaxes, routineId, progressKind, dayOfWeek } = req.body;
+      let dateISO: string | undefined =
+        typeof req.body.dateISO === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(req.body.dateISO)
+          ? req.body.dateISO
+          : undefined;
+      let monthNum: number | undefined =
+        typeof req.body.month === 'number' && req.body.month >= 1 && req.body.month <= 12
+          ? req.body.month
+          : undefined;
 
       const routine = await assertRoutineOwned(userId, routineId);
       if (!routine) {
@@ -229,46 +264,82 @@ router.post(
       }
       const rid = routine._id instanceof mongoose.Types.ObjectId ? routine._id : new mongoose.Types.ObjectId(String(routine._id));
 
+      const y = year != null ? Number(year) : undefined;
+      const w = week != null ? Number(week) : undefined;
+      const d = typeof dayOfWeek === 'number' && !Number.isNaN(dayOfWeek) ? Number(dayOfWeek) : undefined;
+      if (!dateISO && y != null && w != null) {
+        dateISO = dateISOFromYearWeekDay(y, w, d ?? 0);
+      }
+      if (monthNum == null && dateISO) {
+        monthNum = calendarMonth1FromDateISO(dateISO);
+      }
+
       const query: any = { userId, routineId: rid };
       if (week != null && year != null) {
         query.year = Number(year);
         query.week = Number(week);
-        if (dayIndex != null && dayIndex !== '') {
-          query.dayIndex = Number(dayIndex);
+        const d = dayOfWeek;
+        if (typeof d === 'number' && !Number.isNaN(d)) {
+          query.dayOfWeek = Number(d);
         } else {
-          query.$or = [{ dayIndex: { $exists: false } }, { dayIndex: null }];
+          query.$or = [{ dayOfWeek: { $exists: false } }, { dayOfWeek: null }];
         }
       } else {
         query.date = date;
       }
       const existing = await HistoryEntry.findOne(query);
 
+      const rmsBench = typeof rms?.bench === 'number' ? rms.bench : undefined;
+      const rmsSquat = typeof rms?.squat === 'number' ? rms.squat : undefined;
+      const rmsDeadlift = typeof rms?.deadlift === 'number' ? rms.deadlift : undefined;
+
       if (existing) {
-        existing.rms = rms;
         existing.total = total;
-        existing.trainingMaxes = trainingMaxes;
         if (progressKind !== undefined) (existing as any).progressKind = progressKind;
-        if (week !== undefined) existing.week = Number(week);
+        if (week !== undefined) (existing as any).planWeek = Number(week);
         if (year !== undefined) existing.year = Number(year);
-        if (dayIndex != null && dayIndex !== '') (existing as any).dayIndex = Number(dayIndex);
+        if (typeof dayOfWeek === 'number' && !Number.isNaN(dayOfWeek)) {
+          existing.dayOfWeek = Number(dayOfWeek);
+        }
+        if (dateISO) existing.dateISO = dateISO;
+        if (monthNum != null) existing.month = monthNum;
+        if (rmsBench != null) (existing as any).benchRm = rmsBench;
+        if (rmsSquat != null) (existing as any).squatRm = rmsSquat;
+        if (rmsDeadlift != null) (existing as any).deadliftRm = rmsDeadlift;
         existing.routineId = rid;
+        (existing as any).dateLabel = date;
         await existing.save();
-        res.json(existing);
+        const heId = existing._id instanceof mongoose.Types.ObjectId ? existing._id : new mongoose.Types.ObjectId(String(existing._id));
+        if (trainingMaxes && typeof trainingMaxes === 'object') {
+          await saveHistoryTmSnapshots(heId, trainingMaxes);
+        }
+        const tmSnap = await loadHistoryTmSnapshotsAsRecord(heId);
+        res.json({ ...existing.toObject(), trainingMaxes: tmSnap, rms: { bench: (existing as any).benchRm ?? 0, squat: (existing as any).squatRm ?? 0, deadlift: (existing as any).deadliftRm ?? 0 } });
       } else {
+        if (!dateISO) dateISO = new Date().toISOString().slice(0, 10);
+        if (monthNum == null) monthNum = calendarMonth1FromDateISO(dateISO);
         const historyEntry = new HistoryEntry({
           userId,
           routineId: rid,
-          date,
-          week: week != null ? Number(week) : undefined,
-          year: year != null ? Number(year) : undefined,
-          ...(dayIndex != null && dayIndex !== '' ? { dayIndex: Number(dayIndex) } : {}),
-          rms,
+          dateLabel: date,
+          dateISO,
+          year: year != null ? Number(year) : new Date().getFullYear(),
+          month: monthNum!,
+          planWeek: week != null ? Number(week) : undefined,
+          ...(typeof dayOfWeek === 'number' && !Number.isNaN(dayOfWeek) ? { dayOfWeek: Number(dayOfWeek) } : {}),
           total,
-          trainingMaxes,
           ...(progressKind ? { progressKind } : {}),
+          benchRm: rmsBench,
+          squatRm: rmsSquat,
+          deadliftRm: rmsDeadlift,
         });
         await historyEntry.save();
-        res.status(201).json(historyEntry);
+        const heId = historyEntry._id instanceof mongoose.Types.ObjectId ? historyEntry._id : new mongoose.Types.ObjectId(String(historyEntry._id));
+        if (trainingMaxes && typeof trainingMaxes === 'object') {
+          await saveHistoryTmSnapshots(heId, trainingMaxes);
+        }
+        const tmSnap = await loadHistoryTmSnapshotsAsRecord(heId);
+        res.status(201).json({ ...historyEntry.toObject(), trainingMaxes: tmSnap, rms: { bench: historyEntry.benchRm ?? 0, squat: historyEntry.squatRm ?? 0, deadlift: historyEntry.deadliftRm ?? 0 } });
       }
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -298,21 +369,38 @@ router.get(
       }
       const rid = routine._id instanceof mongoose.Types.ObjectId ? routine._id : new mongoose.Types.ObjectId(String(routine._id));
 
-      const history = await HistoryEntry.find({ userId, routineId: rid }).lean();
-      (history as any[]).sort((a, b) => {
-        const ya = (a.year ?? 0) - (b.year ?? 0);
-        if (ya !== 0) return ya;
-        const wa = (a.week ?? 0) - (b.week ?? 0);
-        if (wa !== 0) return wa;
-        const da = a.dayIndex,
-          db = b.dayIndex;
-        if (da == null && db == null) return String(a._id).localeCompare(String(b._id));
-        if (da == null) return 1;
-        if (db == null) return -1;
-        if (da !== db) return da - db;
-        return String(a._id).localeCompare(String(b._id));
-      });
-      res.json(history);
+      const history = await HistoryEntry.find({ userId, routineId: rid }).sort({
+        dateISO: 1,
+        year: 1,
+        planWeek: 1,
+        dayOfWeek: 1,
+        createdAt: 1,
+      }).lean();
+
+      const heIds = history.map((h: any) =>
+        h._id instanceof mongoose.Types.ObjectId ? h._id : new mongoose.Types.ObjectId(String(h._id))
+      );
+      const allSnapshots = heIds.length > 0
+        ? await HistoryTmSnapshot.find({ historyEntryId: { $in: heIds } }).lean()
+        : [];
+      const snapByEntry = new Map<string, Record<string, number>>();
+      for (const s of allSnapshots) {
+        const k = String(s.historyEntryId);
+        if (!snapByEntry.has(k)) snapByEntry.set(k, {});
+        snapByEntry.get(k)![String(s.trainingMaxId)] = s.value;
+      }
+
+      const enriched = history.map((h: any) => ({
+        ...h,
+        trainingMaxes: snapByEntry.get(String(h._id)) || h.trainingMaxes || {},
+        rms: {
+          bench: h.benchRm ?? 0,
+          squat: h.squatRm ?? 0,
+          deadlift: h.deadliftRm ?? 0,
+        },
+        week: h.planWeek ?? h.week,
+      }));
+      res.json(enriched);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }

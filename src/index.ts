@@ -1,5 +1,8 @@
 import express from 'express';
 import cors from 'cors';
+import { existsSync } from 'fs';
+import { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
 import { connectDB } from './config/database';
 import { config } from './config/env';
 import { logger } from './utils/logger';
@@ -11,6 +14,13 @@ import checkinsRoutes from './routes/checkins';
 import notificationsRoutes from './routes/notifications';
 import challengesRoutes from './routes/challenges';
 import internalExerciseMaxesRoutes from './routes/internalExerciseMaxes';
+import { formatApiRequestLogLine } from './utils/apiRequestLogLabel';
+
+/** Build de Vite en ../client/dist — misma carpeta raíz que `server/`. La WebView de Expo hace GET / aquí. */
+const __filename = fileURLToPath(import.meta.url);
+const __dirnameFromFile = dirname(__filename);
+const CLIENT_DIST = join(__dirnameFromFile, '../../client/dist');
+const CLIENT_INDEX = join(CLIENT_DIST, 'index.html');
 
 const app = express();
 
@@ -24,6 +34,9 @@ app.use(cors({
       'http://localhost:3000',
       'http://127.0.0.1:3000',
       'http://10.0.2.2:3000',
+      'http://localhost:3001',
+      'http://127.0.0.1:3001',
+      'http://10.0.2.2:3001',
     ].filter(Boolean);
     if (!origin || allowed.includes(origin) || allowed.includes('null')) {
       callback(null, true);
@@ -33,31 +46,16 @@ app.use(cors({
   },
   credentials: true,
 }));
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+/** Rutinas con muchas semanas + logs de series superan el límite por defecto de Express (~100kb) → PayloadTooLargeError. */
+const JSON_BODY_LIMIT = process.env.JSON_BODY_LIMIT || '15mb';
+app.use(express.json({ limit: JSON_BODY_LIMIT }));
+app.use(express.urlencoded({ extended: true, limit: JSON_BODY_LIMIT }));
 
-// Middleware de logging para TODAS las peticiones (después de parsear el body)
+// Middleware de logging: solo `/api/*`, una línea (sin JSON ni cabeceras)
 app.use((req, res, next) => {
-  const logData: any = {
-    method: req.method,
-    path: req.path,
-    ip: req.ip || req.socket.remoteAddress,
-    headers: {
-      'content-type': req.headers['content-type'],
-      'user-agent': req.headers['user-agent']?.substring(0, 50)
-    }
-  };
-  
-  // Agregar body si existe (ocultar password)
-  if (req.body && Object.keys(req.body).length > 0) {
-    if (req.body.password) {
-      logData.body = { ...req.body, password: '[REDACTED]' };
-    } else {
-      logData.body = req.body;
-    }
-  }
-  
-  logger.info(`${req.method} ${req.path}`, logData);
+  if (req.method === 'OPTIONS') return next();
+  const line = formatApiRequestLogLine(req.path || '', req.method, req.body);
+  if (line) logger.info(line);
   next();
 });
 
@@ -77,8 +75,51 @@ app.use('/api/notifications', notificationsRoutes);
 app.use('/api/challenges', challengesRoutes);
 app.use('/api/internal-exercise-maxes', internalExerciseMaxesRoutes);
 
+// --- Interfaz web (React) en el mismo puerto: necesaria para la app Expo (WebView → GET /) ---
+if (existsSync(CLIENT_INDEX)) {
+  app.use(
+    express.static(CLIENT_DIST, {
+      setHeaders: (res, filePath) => {
+        if (filePath.endsWith('index.html')) {
+          res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+        }
+      },
+    })
+  );
+  app.get(/^(?!\/api\/).*/, (req, res, next) => {
+    if (req.method !== 'GET' && req.method !== 'HEAD') return next();
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.sendFile(CLIENT_INDEX);
+  });
+} else {
+  app.get('/', (_req, res) => {
+    res
+      .status(200)
+      .type('html')
+      .send(`<!DOCTYPE html><html lang="es"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width"/><title>API Powerlifting</title></head>
+<body style="font-family:system-ui,sans-serif;max-width:36rem;margin:2rem auto;padding:0 1rem;line-height:1.5;">
+<h1>Solo API (sin interfaz web generada)</h1>
+<p>Este proceso sirve <code>/api/…</code> y <code>/health</code>, pero <strong>no hay</strong> la app React en <code>GET /</code>.</p>
+<p><strong>App móvil (Expo):</strong> abre otra terminal en la carpeta <code>client</code> y ejecuta:</p>
+<pre style="background:#f1f5f9;padding:12px;border-radius:8px;overflow:auto;">cd client
+npm run dev</pre>
+<p>Eso arranca Vite + API en un solo servidor (interfaz + API).</p>
+<p><strong>O</strong> genera el build y reinicia este servidor:</p>
+<pre style="background:#f1f5f9;padding:12px;border-radius:8px;">cd client
+npm run build</pre>
+<p>Luego este servidor podrá servir los archivos de <code>client/dist</code>.</p>
+</body></html>`);
+  });
+}
+
 // Error handling middleware
 app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (err?.type === 'entity.too.large' || err?.status === 413) {
+    logger.warn('Payload demasiado grande', { path: req.path, limit: JSON_BODY_LIMIT });
+    return res.status(413).json({
+      error: 'El cuerpo de la petición es demasiado grande. Si persiste, contacta soporte.',
+    });
+  }
   logger.error('Error en middleware de manejo de errores', err);
   res.status(err.status || 500).json({
     error: err.message || 'Error interno del servidor',
@@ -91,14 +132,37 @@ const startServer = async () => {
     logger.info('Iniciando servidor...');
     await connectDB();
     
-    app.listen(Number(config.port), '0.0.0.0', () => {
+    const server = app.listen(Number(config.port), '0.0.0.0', () => {
       const startupMessage = `Servidor corriendo en puerto ${config.port}`;
       console.log(`\n✅ ${startupMessage}`);
       console.log(`   http://localhost:${config.port}`);
+      if (!existsSync(CLIENT_INDEX)) {
+        console.log(
+          `\n⚠️  App móvil (Expo WebView): GET / no sirve la interfaz hasta que exista client/dist.\n` +
+            `    Desarrollo recomendado: otra terminal → cd client → npm run dev\n` +
+            `    O: cd client → npm run build → reinicia este servidor.\n`
+        );
+        logger.warn(
+          'Sin client/dist/index.html: la WebView del emulador (http://10.0.2.2:3000/) no cargará la app React.'
+        );
+      } else {
+        console.log(`\n📱 Interfaz web: estática desde client/dist (GET /)\n`);
+      }
       console.log(`\n📧 Email configurado: ${config.email.user}`);
       console.log(`\n⏳ Esperando conexiones...\n`);
       logger.info(startupMessage);
       logger.info(`📁 Logs guardados en: ${process.cwd()}/logs/`);
+    });
+    server.on('error', (err: NodeJS.ErrnoException) => {
+      if (err.code === 'EADDRINUSE') {
+        console.error(
+          `\n❌ El puerto ${config.port} ya está en uso (EADDRINUSE).\n` +
+            `   Cierra el otro proceso (otra terminal con npm run dev, o el servidor unificado en client/)\n` +
+            `   o usa otro puerto: PowerShell → $env:PORT=3010; npm run dev\n`
+        );
+        process.exit(1);
+      }
+      throw err;
     });
   } catch (error: any) {
     logger.error('Error iniciando servidor', error);

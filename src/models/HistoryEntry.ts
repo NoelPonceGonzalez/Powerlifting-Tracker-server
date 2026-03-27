@@ -1,25 +1,28 @@
 import mongoose, { Schema, Document } from 'mongoose';
 
+/**
+ * HistoryEntry: punto de progreso con fecha civil.
+ * TM snapshots → colección HistoryTmSnapshot (sin JSON).
+ * RM bench/squat/deadlift como columnas.
+ */
 export interface IHistoryEntry extends Document {
   userId: mongoose.Types.ObjectId;
-  /** Rutina a la que pertenece este punto de historial (progreso por rutina). */
   routineId?: mongoose.Types.ObjectId;
-  date: string; // Formato: 'Ene', 'Feb', etc. (para mostrar)
-  week?: number; // Semana 1-52 para ordenar por tramos
-  year?: number; // Año para ordenar por tramos
-  /** 0=lun … 6=dom; ausente = snapshot semanal sin día concreto */
-  dayIndex?: number;
-  rms: {
-    bench: number;
-    squat: number;
-    deadlift: number;
-    [key: string]: number;
-  };
+  dateISO: string;
+  dateLabel: string;
+  year: number;
+  month: number;
+  planWeek?: number;
+  dayOfWeek?: number;
   total: number;
-  trainingMaxes: Record<string, number>; // TM ID -> value
-  /** Cómo se agregó `total` en el cliente (peso / reps / seg / mixto). */
   progressKind?: 'weight' | 'reps' | 'seconds' | 'mixed';
+  benchRm?: number;
+  squatRm?: number;
+  deadliftRm?: number;
+  /** @deprecated migrar a HistoryTmSnapshot */
+  trainingMaxes?: Record<string, number>;
   createdAt: Date;
+  updatedAt: Date;
 }
 
 const HistoryEntrySchema = new Schema<IHistoryEntry>(
@@ -35,38 +38,25 @@ const HistoryEntrySchema = new Schema<IHistoryEntry>(
       ref: 'Routine',
       index: true,
     },
-    date: {
-      type: String,
-      required: true,
-    },
-    week: { type: Number },
-    year: { type: Number },
-    dayIndex: { type: Number, min: 0, max: 6 },
-    rms: {
-      type: Schema.Types.Mixed,
-      required: true,
-    },
-    total: {
-      type: Number,
-      required: true,
-    },
-    trainingMaxes: {
-      type: Schema.Types.Mixed,
-      default: {},
-    },
-    progressKind: {
-      type: String,
-      enum: ['weight', 'reps', 'seconds', 'mixed'],
-    },
+    dateISO: { type: String, required: true },
+    dateLabel: { type: String, default: '' },
+    year: { type: Number, required: true },
+    month: { type: Number, required: true, min: 1, max: 12 },
+    planWeek: { type: Number },
+    dayOfWeek: { type: Number, min: 0, max: 6 },
+    total: { type: Number, required: true, default: 0 },
+    progressKind: { type: String, enum: ['weight', 'reps', 'seconds', 'mixed'] },
+    benchRm: { type: Number },
+    squatRm: { type: Number },
+    deadliftRm: { type: Number },
+    trainingMaxes: { type: Schema.Types.Mixed },
   },
-  {
-    timestamps: true,
-  }
+  { timestamps: true }
 );
 
-HistoryEntrySchema.index({ userId: 1, date: 1 });
-HistoryEntrySchema.index({ userId: 1, year: 1, week: 1 });
-HistoryEntrySchema.index({ userId: 1, routineId: 1, year: 1, week: 1 });
+HistoryEntrySchema.index({ userId: 1, routineId: 1, dateISO: 1 });
+HistoryEntrySchema.index({ userId: 1, routineId: 1, year: 1, month: 1 });
+HistoryEntrySchema.index({ userId: 1, routineId: 1, year: 1, planWeek: 1, dayOfWeek: 1 });
 HistoryEntrySchema.index({ userId: 1, createdAt: -1 });
 
 export const HistoryEntry = mongoose.model<IHistoryEntry>('HistoryEntry', HistoryEntrySchema);

@@ -44,9 +44,21 @@ function writeToFile(filePath: string, message: string): void {
   }
 }
 
+function formatMeta(meta: unknown): string {
+  if (meta === undefined || meta === null) return '';
+  if (typeof meta === 'string') return ` ${meta}`;
+  try {
+    const s = JSON.stringify(meta);
+    return s.length > 500 ? ` ${s.slice(0, 500)}…` : ` ${s}`;
+  } catch {
+    return ' [meta]';
+  }
+}
+
 export const logger = {
-  info: (message: string, ...args: any[]) => {
-    const logMessage = `[${getTimestamp()}] [INFO] ${message} ${args.length > 0 ? JSON.stringify(args, null, 2) : ''}`;
+  /** Un solo renglón en consola; el segundo argumento va compacto (sin pretty-print de páginas enteras). */
+  info: (message: string, meta?: unknown) => {
+    const logMessage = `[${getTimestamp()}] [INFO] ${message}${formatMeta(meta)}`;
     console.log(logMessage);
     writeToFile(LOG_FILE, logMessage);
   },
@@ -61,8 +73,8 @@ export const logger = {
     writeToFile(LOG_FILE, logMessage);
   },
 
-  warn: (message: string, ...args: any[]) => {
-    const logMessage = `[${getTimestamp()}] [WARN] ${message} ${args.length > 0 ? JSON.stringify(args, null, 2) : ''}`;
+  warn: (message: string, meta?: unknown) => {
+    const logMessage = `[${getTimestamp()}] [WARN] ${message}${formatMeta(meta)}`;
     console.warn(logMessage);
     writeToFile(LOG_FILE, logMessage);
   }

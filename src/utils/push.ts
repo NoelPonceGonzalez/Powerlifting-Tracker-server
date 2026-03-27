@@ -1,20 +1,26 @@
-import { Expo, ExpoPushMessage } from 'expo-server-sdk';
+import { Expo, ExpoPushMessage, ExpoPushTicket, ExpoPushReceiptId } from 'expo-server-sdk';
 import { User } from '../models/User';
 
 let expo: Expo | null = null;
 
 function getExpo(): Expo {
-  if (!expo) expo = new Expo();
+  if (!expo) {
+    const accessToken = process.env.EXPO_ACCESS_TOKEN?.trim();
+    expo = accessToken ? new Expo({ accessToken }) : new Expo();
+    if (accessToken) {
+      console.log('[PUSH] Expo client inicializado con accessToken (enhanced security)');
+    } else {
+      console.warn(
+        '[PUSH] Sin EXPO_ACCESS_TOKEN — la entrega es menos fiable. ' +
+        'Genera uno en https://expo.dev/accounts/_/settings/access-tokens'
+      );
+    }
+  }
   return expo;
 }
 
-/** Canal Android (debe coincidir con setNotificationChannelAsync('default', ...) en la app). */
 const ANDROID_CHANNEL_ID = 'default';
 
-/**
- * Expo / APNs: el objeto `data` debe usar valores serializables; en iOS los valores custom
- * suelen ir como strings — ver https://docs.expo.dev/push-notifications/sending-notifications/
- */
 function buildPushDataPayload(data?: Record<string, any>): Record<string, string> {
   const type = String(data?.type ?? '');
   let tab: 'friends' | 'challenges' | 'checkins' = 'checkins';
@@ -48,7 +54,51 @@ function buildPushDataPayload(data?: Record<string, any>): Record<string, string
   return out;
 }
 
-/** Envía push a un usuario (Expo → FCM / APNs). */
+// Receipt checking queue — Expo recomienda verificar recibos 15 min después
+const pendingReceipts: ExpoPushReceiptId[] = [];
+let receiptTimerRunning = false;
+
+async function checkReceipts() {
+  if (pendingReceipts.length === 0) return;
+  const client = getExpo();
+  const batch = pendingReceipts.splice(0, 300);
+  try {
+    const receipts = await client.getPushNotificationReceiptsAsync(batch);
+    for (const [id, receipt] of Object.entries(receipts)) {
+      if (receipt.status === 'error') {
+        const { message, details } = receipt as any;
+        console.error('[PUSH RECEIPT]', id, message, details?.error);
+        if ((details as any)?.error === 'DeviceNotRegistered') {
+          // Token inválido: limpiar para no reintentar
+          console.warn('[PUSH] DeviceNotRegistered — se debería limpiar el pushToken del usuario');
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[PUSH RECEIPT] Error verificando recibos:', err);
+    pendingReceipts.push(...batch);
+  }
+}
+
+function scheduleReceiptCheck() {
+  if (receiptTimerRunning) return;
+  receiptTimerRunning = true;
+  setTimeout(async () => {
+    receiptTimerRunning = false;
+    await checkReceipts();
+    if (pendingReceipts.length > 0) scheduleReceiptCheck();
+  }, 15 * 60 * 1000); // 15 min (recomendado por Expo)
+}
+
+function collectTicketIds(tickets: ExpoPushTicket[]) {
+  for (const ticket of tickets) {
+    if (ticket.status === 'ok' && ticket.id) {
+      pendingReceipts.push(ticket.id);
+    }
+  }
+  if (pendingReceipts.length > 0) scheduleReceiptCheck();
+}
+
 export async function sendPushToUser(
   userId: string,
   title: string,
@@ -71,13 +121,15 @@ export async function sendPushToUser(
       body,
       channelId: ANDROID_CHANNEL_ID,
       data: buildPushDataPayload(data),
-      priority: 'high' as const,
+      priority: 'high',
       ttl: 86400,
+      badge: 1,
     };
     const tickets = await client.sendPushNotificationsAsync([message]);
+    collectTicketIds(tickets);
     const ticket = tickets[0];
     if (ticket?.status === 'error') {
-      console.error('[PUSH] Error ticket para', userId, (ticket as any).message);
+      console.error('[PUSH] Error ticket para', userId, (ticket as any).message, (ticket as any).details);
     } else {
       console.log('[PUSH] Enviado a', userId, ':', title);
     }
@@ -124,13 +176,18 @@ export async function sendPushToUsers(
       data: payloadData,
       priority: 'high' as const,
       ttl: 86400,
+      badge: 1,
     }));
-    const tickets = await client.sendPushNotificationsAsync(messages);
-    const errors = tickets.filter((t: any) => t?.status === 'error');
-    if (errors.length > 0) {
-      console.error('[PUSH] Errores en envío:', errors.map((e: any) => (e as any).message));
-    } else {
-      console.log('[PUSH] Enviadas', tickets.length, 'notificaciones:', title);
+    const chunks = client.chunkPushNotifications(messages);
+    for (const chunk of chunks) {
+      const tickets = await client.sendPushNotificationsAsync(chunk);
+      collectTicketIds(tickets);
+      const errors = tickets.filter((t: any) => t?.status === 'error');
+      if (errors.length > 0) {
+        console.error('[PUSH] Errores en envío:', errors.map((e: any) => ({ msg: (e as any).message, details: (e as any).details })));
+      } else {
+        console.log('[PUSH] Enviadas', tickets.length, 'notificaciones:', title);
+      }
     }
   } catch (err) {
     console.error('[PUSH] Error enviando a usuarios', err);

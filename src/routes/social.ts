@@ -1,4 +1,5 @@
 import express, { Request, Response } from 'express';
+import mongoose from 'mongoose';
 import { authenticateToken } from '../middleware/auth';
 import { User } from '../models/User';
 import { Friendship } from '../models/Friendship';
@@ -6,6 +7,7 @@ import { Notification } from '../models/Notification';
 import { Routine } from '../models/Routine';
 import { TrainingMax } from '../models/TrainingMax';
 import { body, validationResult } from 'express-validator';
+import { assembleFullRoutine } from '../utils/assembleRoutine';
 
 const router = express.Router();
 
@@ -83,19 +85,21 @@ router.get('/friends/:friendId/routine', authenticateToken, async (req: Request,
       return res.status(403).json({ error: 'Solo puedes ver la rutina de tus amigos' });
     }
 
-    const routine = await Routine.findOne({ userId: friendId, isActive: true });
+    const friendObjectId = new mongoose.Types.ObjectId(String(friendId));
+    const routine = await Routine.findOne({ userId: friendObjectId, isActive: true });
     if (!routine || (routine as any).hiddenFromSocial) {
       return res.json(null);
     }
 
-    const logsRaw = routine.logs as Map<string, unknown> | Record<string, unknown> | undefined;
-    const logsObj = logsRaw instanceof Map ? Object.fromEntries(logsRaw.entries()) : (logsRaw || {});
+    const assembled = (await assembleFullRoutine(routine)) as Record<string, unknown>;
 
     res.json({
-      id: routine._id.toString(),
-      name: routine.name,
-      weeks: routine.weeks,
-      logs: logsObj,
+      id: String(assembled._id ?? assembled.id ?? ''),
+      name: assembled.name,
+      weeks: assembled.weeks,
+      baseTemplate: assembled.baseTemplate,
+      versions: assembled.versions,
+      logs: assembled.logs,
     });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
