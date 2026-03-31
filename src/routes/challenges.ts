@@ -6,97 +6,34 @@ import { Friendship } from '../models/Friendship';
 import { User } from '../models/User';
 import { Notification } from '../models/Notification';
 import { body, validationResult } from 'express-validator';
+import {
+  computeChallengeScore,
+  computeDisplayScoreForChallengeParticipant,
+  normalizeBodyWeightScoring,
+  type ChallengeScoreType,
+  type Gender,
+} from '../utils/challengeScoring';
+import { getBodyWeightAndGenderFromParticipant } from '../utils/challengeParticipantUtils';
 
 const router = express.Router();
 
-type ChallengeScoreType = 'max_reps' | 'weight' | 'seconds';
-type Gender = 'hombre' | 'mujer';
-
-type IpfGlCoefficients = {
-  a: number;
-  b: number;
-  c: number;
-};
-
-const IPF_GL_COEFFICIENTS: Record<Gender, Record<'powerlifting' | 'squat' | 'bench' | 'deadlift', IpfGlCoefficients>> = {
-  hombre: {
-    powerlifting: { a: 1199.72839, b: 1025.18162, c: 0.00921 },
-    squat: { a: 1236.25115, b: 1449.21864, c: 0.01644 },
-    bench: { a: 381.22073, b: 733.79378, c: 0.02398 },
-    deadlift: { a: 674.585, b: 1149.692, c: 0.015 },
-  },
-  mujer: {
-    powerlifting: { a: 610.32796, b: 1045.59282, c: 0.03048 },
-    squat: { a: 758.63878, b: 949.31382, c: 0.02435 },
-    bench: { a: 221.82209, b: 357.00377, c: 0.02937 },
-    deadlift: { a: 482.50024, b: 819.10084, c: 0.02963 },
-  },
-};
-
-function getIpfGlCoefficients(exercise: string, gender: Gender): IpfGlCoefficients {
-  const normalized = exercise.toLowerCase();
-
-  if (/(bench|press banca|banca)/i.test(normalized)) {
-    return IPF_GL_COEFFICIENTS[gender].bench;
-  }
-  if (/(squat|sentadilla)/i.test(normalized)) {
-    return IPF_GL_COEFFICIENTS[gender].squat;
-  }
-  if (/(deadlift|peso muerto)/i.test(normalized)) {
-    return IPF_GL_COEFFICIENTS[gender].deadlift;
-  }
-
-  return IPF_GL_COEFFICIENTS[gender].powerlifting;
-}
-
-function computeIpfGlPoints(value: number, bodyWeight: number, exercise: string, gender: Gender): number {
-  const safeBodyWeight = bodyWeight > 0 ? bodyWeight : 70;
-  const coeffs = getIpfGlCoefficients(exercise, gender);
-  const denominator = coeffs.a - coeffs.b * Math.exp(-coeffs.c * safeBodyWeight);
-
-  if (denominator <= 0) {
-    return 0;
-  }
-
-  const points = (100 / denominator) * value;
-  return Math.round(points * 100) / 100;
-}
-
-/** Calcula puntos según tipo de torneo */
-function computeScore(
-  type: ChallengeScoreType,
-  value: number,
+function displayScoreForParticipant(
+  challenge: { type: string; exercise: string; usePointsSystem?: boolean; bodyWeightScoring?: string },
+  p: { value: number },
   bodyWeight: number,
-  gender?: Gender,
-  exercise = ''
+  gender?: Gender
 ): number {
-  if (!bodyWeight || bodyWeight <= 0) bodyWeight = 70;
-  const safeGender: Gender = gender === 'mujer' ? 'mujer' : 'hombre';
-  const genderFactor = safeGender === 'mujer' ? 1.15 : 1;
-
-  switch (type) {
-    case 'max_reps':
-      return Math.round((value / bodyWeight) * 100 * genderFactor);
-    case 'weight':
-      return computeIpfGlPoints(value, bodyWeight, exercise, safeGender);
-    case 'seconds':
-      return Math.round((value / bodyWeight) * 10 * genderFactor);
-    default:
-      return Math.round((value / bodyWeight) * 100 * genderFactor);
-  }
-}
-
-function getBodyWeightAndGenderFromParticipant(participant: any): { bodyWeight: number; gender?: Gender } {
-  const populatedUser = participant?.userId as any;
-  const bodyWeight =
-    typeof populatedUser?.bodyWeight === 'number' && populatedUser.bodyWeight > 0
-      ? populatedUser.bodyWeight
-      : 70;
-  const gender = populatedUser?.gender === 'mujer' || populatedUser?.gender === 'hombre'
-    ? populatedUser.gender
-    : undefined;
-
-  return { bodyWeight, gender };
+  return computeDisplayScoreForChallengeParticipant(
+    {
+      type: challenge.type as ChallengeScoreType,
+      exercise: challenge.exercise,
+      usePointsSystem: challenge.usePointsSystem,
+      bodyWeightScoring: challenge.bodyWeightScoring,
+    },
+    p.value,
+    bodyWeight,
+    gender
+  );
 }
 
 /** Obtiene los ObjectIds de amigos de un usuario */
@@ -146,12 +83,16 @@ router.get('/', authenticateToken, async (req: Request, res: Response) => {
 
     const formatted = challenges.map(c => {
       const isFinished = c.endDate <= now;
+      const createdAt = (c as { createdAt?: Date }).createdAt;
       return {
         id: c._id.toString(),
         title: c.title,
         description: c.description || '',
         type: c.type,
         exercise: c.exercise,
+        usePointsSystem: c.usePointsSystem !== false,
+        bodyWeightScoring: normalizeBodyWeightScoring(c.bodyWeightScoring),
+        createdAt: createdAt ? new Date(createdAt).toISOString() : undefined,
         participants: c.participants.map(p => {
           const { bodyWeight, gender } = getBodyWeightAndGenderFromParticipant(p);
           const populatedUser = p.userId as any;
@@ -160,7 +101,7 @@ router.get('/', authenticateToken, async (req: Request, res: Response) => {
             userId: p.userId.toString(),
             name: p.name,
             avatar,
-            score: c.type === 'weight' ? computeScore('weight', p.value, bodyWeight, gender, c.exercise) : p.score,
+            score: displayScoreForParticipant(c, p, bodyWeight, gender),
             value: p.value,
             initialValue: p.initialValue,
             initialScore: p.initialScore,
@@ -201,6 +142,9 @@ router.post(
 
       const userId = (req as any).user.userId;
       const { title, type, exercise, endDate, description } = req.body;
+      const usePointsSystem =
+        req.body.usePointsSystem !== false && req.body.usePointsSystem !== 'false';
+      const bodyWeightScoring = normalizeBodyWeightScoring(req.body.bodyWeightScoring);
 
       const creator = await User.findById(userId);
       const creatorName = creator?.name || creator?.email || 'Usuario';
@@ -212,6 +156,8 @@ router.post(
         description: description || '',
         type,
         exercise,
+        usePointsSystem,
+        bodyWeightScoring,
         endDate: new Date(endDate),
         participants: [{
           userId: userId as any,
@@ -261,7 +207,7 @@ router.post(
           userId: p.userId.toString(),
           name: p.name,
           avatar: p.avatar,
-          score: created!.type === 'weight' ? computeScore('weight', p.value, bodyWeight, gender, created!.exercise) : p.score,
+          score: displayScoreForParticipant(created!, p, bodyWeight, gender),
           value: p.value,
           initialValue: p.initialValue,
           initialScore: p.initialScore,
@@ -275,6 +221,11 @@ router.post(
         description: created!.description || '',
         type: created!.type,
         exercise: created!.exercise,
+        usePointsSystem: created!.usePointsSystem !== false,
+        bodyWeightScoring: normalizeBodyWeightScoring(created!.bodyWeightScoring),
+        createdAt: (created! as { createdAt?: Date }).createdAt
+          ? new Date((created! as { createdAt?: Date }).createdAt!).toISOString()
+          : new Date().toISOString(),
         participants: participantsFormatted,
         endDate: created!.endDate,
         status: created!.endDate > new Date() ? 'active' : 'finished',
@@ -330,12 +281,16 @@ router.put(
 
       const bodyWeight = user?.bodyWeight ?? 70;
       const gender = user?.gender;
-      const score = computeScore(
+      const usePts = challenge.usePointsSystem !== false;
+      const bwMode = normalizeBodyWeightScoring(challenge.bodyWeightScoring);
+      const score = computeChallengeScore(
         challenge.type as ChallengeScoreType,
         value,
         bodyWeight,
         gender,
-        challenge.exercise
+        challenge.exercise,
+        usePts,
+        bwMode
       );
 
       const existingParticipant = challenge.participants.find(
@@ -400,6 +355,11 @@ router.put(
         description: updated!.description || '',
         type: updated!.type,
         exercise: updated!.exercise,
+        usePointsSystem: updated!.usePointsSystem !== false,
+        bodyWeightScoring: normalizeBodyWeightScoring(updated!.bodyWeightScoring),
+        createdAt: (updated! as { createdAt?: Date }).createdAt
+          ? new Date((updated! as { createdAt?: Date }).createdAt!).toISOString()
+          : undefined,
         participants: updated!.participants.map(p => {
           const { bodyWeight, gender } = getBodyWeightAndGenderFromParticipant(p);
           const populatedUser = p.userId as any;
@@ -408,7 +368,7 @@ router.put(
             userId: p.userId.toString(),
             name: p.name,
             avatar,
-            score: updated!.type === 'weight' ? computeScore('weight', p.value, bodyWeight, gender, updated!.exercise) : p.score,
+            score: displayScoreForParticipant(updated!, p, bodyWeight, gender),
             value: p.value,
             initialValue: p.initialValue,
             initialScore: p.initialScore,

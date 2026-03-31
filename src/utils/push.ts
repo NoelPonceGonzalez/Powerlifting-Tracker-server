@@ -26,7 +26,7 @@ function buildPushDataPayload(data?: Record<string, any>): Record<string, string
   let tab: 'friends' | 'challenges' | 'checkins' = 'checkins';
   if (type === 'friend_request' || type === 'friend_accepted') {
     tab = 'friends';
-  } else if (type === 'challenge_invite' || type === 'challenge_join') {
+  } else if (type === 'challenge_invite' || type === 'challenge_join' || type === 'challenge_winner') {
     tab = 'challenges';
   } else if (
     type === 'gym_checkin' ||
@@ -69,8 +69,10 @@ async function checkReceipts() {
         const { message, details } = receipt as any;
         console.error('[PUSH RECEIPT]', id, message, details?.error);
         if ((details as any)?.error === 'DeviceNotRegistered') {
-          // Token inválido: limpiar para no reintentar
-          console.warn('[PUSH] DeviceNotRegistered — se debería limpiar el pushToken del usuario');
+          console.warn('[PUSH] DeviceNotRegistered — limpiando pushToken inválido');
+          User.updateMany({ pushToken: { $in: batch } }, { $unset: { pushToken: '' } }).catch(e =>
+            console.error('[PUSH] Error limpiando tokens inválidos:', e)
+          );
         }
       }
     }

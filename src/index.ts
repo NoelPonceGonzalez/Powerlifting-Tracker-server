@@ -4,7 +4,7 @@ import { existsSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { connectDB } from './config/database';
-import { config } from './config/env';
+import { config, getCorsAllowedOrigins } from './config/env';
 import { logger } from './utils/logger';
 import authRoutes from './routes/auth';
 import routinesRoutes from './routes/routines';
@@ -15,6 +15,7 @@ import notificationsRoutes from './routes/notifications';
 import challengesRoutes from './routes/challenges';
 import internalExerciseMaxesRoutes from './routes/internalExerciseMaxes';
 import { formatApiRequestLogLine } from './utils/apiRequestLogLabel';
+import { processFinishedChallengeWinnerNotifications } from './utils/challengeFinishedNotifications';
 
 /** Build de Vite en ../client/dist — misma carpeta raíz que `server/`. La WebView de Expo hace GET / aquí. */
 const __filename = fileURLToPath(import.meta.url);
@@ -25,23 +26,15 @@ const CLIENT_INDEX = join(CLIENT_DIST, 'index.html');
 const app = express();
 
 // Middleware básico (CORS y parsing)
-// Permite app web, app móvil (file:// → Origin: null) y localhost
+// Producción: APP_URL + CORS_ORIGINS (AWS). Localhost solo si NODE_ENV≠production o ALLOW_LOCALHOST_CORS=true
 app.use(cors({
   origin: (origin, callback) => {
-    const allowed = [
-      config.appUrl,
-      'null',
-      'http://localhost:3000',
-      'http://127.0.0.1:3000',
-      'http://10.0.2.2:3000',
-      'http://localhost:3001',
-      'http://127.0.0.1:3001',
-      'http://10.0.2.2:3001',
-    ].filter(Boolean);
-    if (!origin || allowed.includes(origin) || allowed.includes('null')) {
+    const allowed = getCorsAllowedOrigins();
+    if (!origin || allowed.includes(origin)) {
       callback(null, true);
     } else {
-      callback(null, config.appUrl);
+      logger.warn(`CORS: origen no permitido: ${origin}`);
+      callback(null, false);
     }
   },
   credentials: true,
@@ -135,7 +128,17 @@ const startServer = async () => {
     const server = app.listen(Number(config.port), '0.0.0.0', () => {
       const startupMessage = `Servidor corriendo en puerto ${config.port}`;
       console.log(`\n✅ ${startupMessage}`);
-      console.log(`   http://localhost:${config.port}`);
+      if (config.nodeEnv === 'production' && config.appUrl) {
+        console.log(`   APP_URL (público): ${config.appUrl}`);
+      }
+      if (config.nodeEnv !== 'production' || process.env.ALLOW_LOCALHOST_CORS === 'true') {
+        console.log(`   Local: http://localhost:${config.port}`);
+      }
+      if (config.nodeEnv === 'production' && !config.appUrl && !process.env.CORS_ORIGINS) {
+        logger.warn(
+          'Producción sin APP_URL ni CORS_ORIGINS: configura el dominio del frontend (AWS) en variables de entorno.'
+        );
+      }
       if (!existsSync(CLIENT_INDEX)) {
         console.log(
           `\n⚠️  App móvil (Expo WebView): GET / no sirve la interfaz hasta que exista client/dist.\n` +
@@ -152,6 +155,14 @@ const startServer = async () => {
       console.log(`\n⏳ Esperando conexiones...\n`);
       logger.info(startupMessage);
       logger.info(`📁 Logs guardados en: ${process.cwd()}/logs/`);
+
+      const runWinnerNotifications = () => {
+        processFinishedChallengeWinnerNotifications().catch((err) =>
+          logger.error('Notificaciones de torneos finalizados', err)
+        );
+      };
+      setTimeout(runWinnerNotifications, 15_000);
+      setInterval(runWinnerNotifications, 5 * 60 * 1000);
     });
     server.on('error', (err: NodeJS.ErrnoException) => {
       if (err.code === 'EADDRINUSE') {

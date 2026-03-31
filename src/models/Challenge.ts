@@ -1,4 +1,5 @@
 import mongoose, { Schema, Document } from 'mongoose';
+import type { BodyWeightScoringMode } from '../utils/challengeScoring';
 
 export interface IChallengeParticipant {
   userId: mongoose.Types.ObjectId;
@@ -19,6 +20,12 @@ export interface IChallenge extends Document {
   description?: string;
   type: ChallengeType;
   exercise: string;
+  /** Si false, el ranking usa la marca bruta (kg / reps / s). Si true, IPF GL (peso) y fórmulas por peso/género (reps/seg). */
+  usePointsSystem: boolean;
+  /** Ponderación por peso en reps/seg: más peso = más puntos | menos peso = más puntos | sin ponderar. */
+  bodyWeightScoring: BodyWeightScoringMode;
+  /** Cuándo se enviaron notificaciones de ganador al cerrar el torneo. */
+  winnerNotifiedAt?: Date | null;
   participants: IChallengeParticipant[];
   endDate: Date;
   createdAt: Date;
@@ -76,6 +83,19 @@ const ChallengeSchema = new Schema<IChallenge>(
     exercise: {
       type: String,
       required: true,
+    },
+    usePointsSystem: {
+      type: Boolean,
+      default: true,
+    },
+    bodyWeightScoring: {
+      type: String,
+      enum: ['heavier_more', 'lighter_more', 'neutral'],
+      default: 'heavier_more',
+    },
+    winnerNotifiedAt: {
+      type: Date,
+      default: null,
     },
     participants: [ChallengeParticipantSchema],
     endDate: {

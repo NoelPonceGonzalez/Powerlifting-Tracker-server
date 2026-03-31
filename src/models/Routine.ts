@@ -11,6 +11,8 @@ export interface IRoutine extends Document {
   isActive: boolean;
   sameTemplateAllWeeks?: boolean;
   hiddenFromSocial?: boolean;
+  cycleLength?: number;
+  skippedWeeks?: number[];
   createdAt: Date;
   updatedAt: Date;
 }
@@ -40,6 +42,16 @@ const RoutineSchema = new Schema<IRoutine>(
     hiddenFromSocial: {
       type: Boolean,
       default: false,
+    },
+    cycleLength: {
+      type: Number,
+      default: 4,
+      min: 1,
+      max: 52,
+    },
+    skippedWeeks: {
+      type: [Number],
+      default: [],
     },
   },
   {

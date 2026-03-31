@@ -5,6 +5,7 @@ export type NotificationType =
   | 'friend_request'
   | 'challenge_invite'
   | 'challenge_join'
+  | 'challenge_winner'
   | 'friend_accepted';
 
 export interface INotification extends Document {
@@ -33,6 +34,7 @@ const NotificationSchema = new Schema<INotification>(
         'friend_request',
         'challenge_invite',
         'challenge_join',
+        'challenge_winner',
         'friend_accepted',
       ],
       required: true,

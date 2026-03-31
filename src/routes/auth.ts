@@ -1,11 +1,12 @@
 import express, { Request, Response } from 'express';
 import { body, validationResult } from 'express-validator';
 import { User } from '../models/User';
+import { PendingSignup, IPendingSignup } from '../models/PendingSignup';
 import { sendVerificationEmail } from '../utils/email';
 import { hashPassword, comparePassword } from '../utils/crypto';
 import { generateToken, authenticateToken, AuthRequest } from '../middleware/auth';
 import { logger } from '../utils/logger';
-import { config } from '../config/env';
+import { config, getPublicWebBaseUrl } from '../config/env';
 
 const router = express.Router();
 
@@ -76,52 +77,49 @@ router.post(
 
       const { email } = req.body;
 
-      // Verificar si el usuario ya existe
+      // Cuenta ya completada en User (contraseña fijada)
       const existingUser = await User.findOne({ email });
-      
-      if (existingUser) {
-        if (existingUser.emailVerified) {
-          return res.status(400).json({ error: 'Este email ya está registrado y verificado' });
-        }
-        // Si existe pero no está verificado, regenerar token
-        const verificationToken = generateNumericVerificationCode();
-        existingUser.verificationToken = verificationToken;
-        existingUser.verificationTokenExpires = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 horas
-        await existingUser.save();
-        
-        await sendVerificationEmail(email, verificationToken);
-        return res.json({ 
-          message: 'Código reenviado. Revisa tu bandeja de entrada.',
-          requiresVerification: true,
-          requiresCode: true,
-        });
+      if (existingUser?.password) {
+        return res.status(400).json({ error: 'Este email ya está registrado' });
+      }
+      // Huérfano antiguo: documento User sin contraseña (flujo previo) — quitar para liberar email
+      if (existingUser && !existingUser.password) {
+        await User.findByIdAndDelete(existingUser._id);
       }
 
-      // Crear nuevo usuario sin verificar
       const verificationToken = generateNumericVerificationCode();
-      const newUser = new User({
-        email,
-        emailVerified: false,
-        verificationToken,
-        verificationTokenExpires: new Date(Date.now() + 24 * 60 * 60 * 1000), // 24 horas
-      });
+      const verificationTokenExpires = new Date(Date.now() + 24 * 60 * 60 * 1000);
 
-      await newUser.save();
+      const existingPending = await PendingSignup.findOne({ email });
+      let createdNewPending = false;
+      let pendingDoc: IPendingSignup;
 
-      // Enviar email de verificación
+      if (existingPending) {
+        existingPending.verificationToken = verificationToken;
+        existingPending.verificationTokenExpires = verificationTokenExpires;
+        await existingPending.save();
+        pendingDoc = existingPending;
+      } else {
+        pendingDoc = await PendingSignup.create({
+          email,
+          verificationToken,
+          verificationTokenExpires,
+        });
+        createdNewPending = true;
+      }
+
       try {
         await sendVerificationEmail(email, verificationToken);
       } catch (emailError: any) {
         logger.error('Error enviando email de verificación', emailError);
-        
-        // Eliminar el usuario creado si falla el email (rollback)
-        try {
-          await User.findByIdAndDelete(newUser._id);
-        } catch (deleteError) {
-          logger.error('Error eliminando usuario después de fallo de email', deleteError);
+        if (createdNewPending) {
+          try {
+            await PendingSignup.findByIdAndDelete(pendingDoc._id);
+          } catch (deleteError) {
+            logger.error('Error eliminando pending después de fallo de email', deleteError);
+          }
         }
-        
-        // Mensaje de error más específico según el tipo de error de email
+
         let errorMessage = 'Error al enviar el email de verificación';
         if (emailError.code === 'EAUTH' || emailError.message?.includes('Invalid login')) {
           errorMessage = 'Error de autenticación del servidor de correo. Verifica las credenciales en la configuración.';
@@ -130,10 +128,10 @@ router.post(
         } else if (emailError.message) {
           errorMessage = `Error al enviar email: ${emailError.message}`;
         }
-        
-        return res.status(500).json({ 
+
+        return res.status(500).json({
           error: errorMessage,
-          emailError: emailError.message 
+          emailError: emailError.message,
         });
       }
 
@@ -181,14 +179,13 @@ router.post(
       }
 
       const { email, code } = req.body;
-      const user = await User.findOne({
+      const pending = await PendingSignup.findOne({
         email,
-        emailVerified: false,
         verificationToken: code,
         verificationTokenExpires: { $gt: new Date() },
       });
 
-      if (!user) {
+      if (!pending) {
         return res.status(400).json({ error: 'Código inválido o expirado' });
       }
 
@@ -221,12 +218,12 @@ router.get(
         `);
       }
 
-      const user = await User.findOne({
+      const pending = await PendingSignup.findOne({
         verificationToken: token,
         verificationTokenExpires: { $gt: new Date() },
       });
 
-      if (!user) {
+      if (!pending) {
         return res.status(400).send(`
           <html>
             <body style="font-family: sans-serif; text-align: center; padding: 50px;">
@@ -238,7 +235,10 @@ router.get(
       }
 
       const mobileUrl = `${config.mobileAppScheme}://complete-registration?token=${encodeURIComponent(token)}`;
-      const webFormUrl = `${config.appUrl}/api/auth/verify-email?token=${encodeURIComponent(token)}&web=1`;
+      const webBase = getPublicWebBaseUrl();
+      const webFormUrl = webBase
+        ? `${webBase}/api/auth/verify-email?token=${encodeURIComponent(token)}&web=1`
+        : mobileUrl;
       // Por defecto abrimos la app; con ?web=1 se fuerza el formulario web clásico.
       if (String(req.query.web || '') !== '1') return res.send(`
         <!DOCTYPE html>
@@ -577,56 +577,59 @@ router.post(
 
       const { token, name, bodyWeight, password, gender } = req.body;
 
-      const user = await User.findOne({
+      const pending = await PendingSignup.findOne({
         verificationToken: token,
         verificationTokenExpires: { $gt: new Date() },
       });
 
-      if (!user) {
+      if (!pending) {
         return res.status(400).json({ error: 'Token inválido o expirado' });
       }
 
-      // Encriptar contraseña
-      const hashedPassword = await hashPassword(password);
+      const email = pending.email.trim().toLowerCase();
+      const already = await User.findOne({
+        email,
+        password: { $exists: true, $nin: [null, ''] },
+      });
+      if (already) {
+        await PendingSignup.deleteOne({ _id: pending._id });
+        return res.status(400).json({ error: 'Este email ya está registrado' });
+      }
 
-      // Generar username único desde el nombre
+      const hashedPassword = await hashPassword(password);
       const baseUsername = generateUsername(name);
-      
-      // Validar que el username tenga al menos 3 caracteres
+
       if (!baseUsername || baseUsername.length < 3) {
         throw new Error('No se pudo generar un nombre de usuario válido. Por favor, usa un nombre con al menos 3 letras.');
       }
-      
+
       const uniqueUsername = await ensureUniqueUsername(baseUsername);
-      
-      // Validar nuevamente antes de asignar
+
       if (!uniqueUsername || uniqueUsername.length < 3) {
         throw new Error('Error al generar nombre de usuario único');
       }
 
-      // Actualizar usuario
-      user.name = name.trim();
-      user.username = uniqueUsername.trim(); // Mantener mayúsculas/minúsculas tal cual
-      user.bodyWeight = Number(bodyWeight);
-      user.password = hashedPassword;
-      user.gender = gender;
-      user.emailVerified = true;
-      user.verificationToken = undefined;
-      user.verificationTokenExpires = undefined;
-      
-      // Asegurar que avatar y theme tengan valores por defecto si no existen
-      if (!user.avatar) {
-        user.avatar = '';
-      }
-      // theme: no asignar por defecto; el cliente usará prefers-color-scheme si undefined
+      const user = new User({
+        email,
+        name: name.trim(),
+        username: uniqueUsername.trim(),
+        bodyWeight: Number(bodyWeight),
+        password: hashedPassword,
+        gender,
+        emailVerified: true,
+        avatar: '',
+      });
 
-      // Validar antes de guardar
       const validationError = user.validateSync();
       if (validationError) {
-        throw new Error('Error de validación: ' + Object.values(validationError.errors || {}).map((e: any) => e.message).join(', '));
+        throw new Error(
+          'Error de validación: ' +
+            Object.values(validationError.errors || {}).map((e: any) => e.message).join(', ')
+        );
       }
 
       await user.save();
+      await PendingSignup.deleteOne({ _id: pending._id });
 
       // Generar token JWT
       const jwtToken = generateToken(user._id.toString(), user.email);
@@ -877,8 +880,16 @@ router.get('/me', authenticateToken, async (req: AuthRequest, res: Response) => 
   }
 });
 
-// 6. Logout (el cliente simplemente elimina el token)
-router.post('/logout', authenticateToken, (req: Request, res: Response) => {
+// 6. Logout — limpiar pushToken para no enviar notificaciones al dispositivo anterior.
+router.post('/logout', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthRequest).userId || (req as any).user?.userId;
+    if (userId) {
+      await User.findByIdAndUpdate(userId, { $unset: { pushToken: '' } });
+    }
+  } catch {
+    /* best-effort */
+  }
   res.json({ message: 'Logout exitoso' });
 });
 

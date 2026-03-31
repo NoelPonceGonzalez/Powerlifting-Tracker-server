@@ -6,10 +6,22 @@ import { Friendship } from '../models/Friendship';
 import { Notification } from '../models/Notification';
 import { Routine } from '../models/Routine';
 import { TrainingMax } from '../models/TrainingMax';
+import { HistoryEntry } from '../models/HistoryEntry';
 import { body, validationResult } from 'express-validator';
 import { assembleFullRoutine } from '../utils/assembleRoutine';
 
 const router = express.Router();
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** Cuenta creada solo tras completar registro: contraseña, nombre y género en MongoDB. */
+const REGISTERED_USER_MATCH = {
+  password: { $exists: true, $nin: [null, ''] },
+  name: { $exists: true, $nin: [null, ''] },
+  gender: { $in: ['hombre', 'mujer'] },
+} as const;
 
 // GET /api/social/search - Buscar usuarios por nombre
 router.get(
@@ -17,50 +29,96 @@ router.get(
   authenticateToken,
   async (req: Request, res: Response) => {
     try {
-      const userId = (req as any).user.userId;
-      const query = req.query.q as string;
-
-      if (!query || query.trim().length < 2) {
+      const userId = String((req as any).user.userId ?? '').trim();
+      let userIdOid: mongoose.Types.ObjectId;
+      try {
+        userIdOid = new mongoose.Types.ObjectId(userId);
+      } catch {
         return res.json([]);
       }
 
-      // Buscar usuarios por nombre, email o username (excluyendo al usuario actual)
+      const query = (req.query.q as string) || '';
+      const trimmed = query.trim();
+      if (trimmed.length < 1) {
+        return res.json([]);
+      }
+      // No buscar por correo: solo por nombre visible.
+      if (trimmed.includes('@')) {
+        return res.json([]);
+      }
+
+      // Misma lógica que GET /api/social/friends: excluir amigos ya aceptados.
+      const acceptedFriendships = await Friendship.find({
+        $or: [{ requester: userIdOid }, { recipient: userIdOid }],
+        status: 'accepted',
+      }).lean();
+      const acceptedFriendIdSet = new Set<string>();
+      for (const f of acceptedFriendships) {
+        const reqId = String((f.requester as any)?.toString?.() ?? f.requester);
+        const recId = String((f.recipient as any)?.toString?.() ?? f.recipient);
+        const otherId = reqId === userId ? recId : recId === userId ? reqId : null;
+        if (otherId && otherId !== userId) acceptedFriendIdSet.add(otherId);
+      }
+
+      const escaped = escapeRegex(trimmed);
+
+      // Coincidencia en nombre/username sin espacios (ej. "noelpon" → "Noel Ponce González").
+      const nameCompactMatch = {
+        $expr: {
+          $regexMatch: {
+            input: {
+              $replaceAll: {
+                input: { $toLower: { $ifNull: ['$name', ''] } },
+                find: ' ',
+                replacement: '',
+              },
+            },
+            regex: escaped,
+            options: 'i',
+          },
+        },
+      };
+      // Solo por nombre visible (no email / Gmail).
       const users = await User.find({
-        _id: { $ne: userId },
-        emailVerified: true,
-        $or: [
-          { name: { $regex: query, $options: 'i' } },
-          { email: { $regex: query, $options: 'i' } },
-          ...(query.length >= 2 ? [{ username: { $regex: query, $options: 'i' } }] : []),
-        ],
+        _id: { $ne: userIdOid },
+        ...REGISTERED_USER_MATCH,
+        $or: [{ name: { $regex: escaped, $options: 'i' } }, nameCompactMatch],
       })
         .select('name email username avatar bodyWeight')
-        .limit(20);
+        .limit(30);
 
-      // Obtener el estado de amistad para cada usuario
-      const userIds = users.map(u => u._id);
-      const friendships = await Friendship.find({
-        $or: [
-          { requester: userId, recipient: { $in: userIds } },
-          { requester: { $in: userIds }, recipient: userId },
-        ],
-      });
+      const usersForResults = users.filter(u => !acceptedFriendIdSet.has(u._id.toString()));
 
-      const friendshipMap = new Map();
+      // Estado pendiente / rechazado respecto a cada candidato (los aceptados ya están fuera).
+      const userIds = usersForResults.map(u => u._id);
+      const friendships =
+        userIds.length === 0
+          ? []
+          : await Friendship.find({
+              $or: [
+                { requester: userIdOid, recipient: { $in: userIds } },
+                { requester: { $in: userIds }, recipient: userIdOid },
+              ],
+            });
+
+      const friendshipMap = new Map<string, string>();
+      const selfId = userIdOid.toString();
       friendships.forEach(f => {
-        const otherUserId = f.requester.toString() === userId ? f.recipient.toString() : f.requester.toString();
+        const otherUserId = f.requester.toString() === selfId ? f.recipient.toString() : f.requester.toString();
         friendshipMap.set(otherUserId, f.status);
       });
 
-      const results = users.map(user => ({
-        id: user._id.toString(),
-        name: user.name || (user as any).username || user.email,
-        email: user.email,
-        username: (user as any).username,
-        avatar: user.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(user.name || (user as any).username || user.email)}`,
-        bodyWeight: user.bodyWeight,
-        friendshipStatus: friendshipMap.get(user._id.toString()) || null,
-      }));
+      const results = usersForResults.map(user => ({
+          id: user._id.toString(),
+          name: user.name || (user as any).username || user.email,
+          email: user.email,
+          username: (user as any).username,
+          avatar:
+            user.avatar ||
+            `https://ui-avatars.com/api/?name=${encodeURIComponent(user.name || (user as any).username || user.email)}`,
+          bodyWeight: user.bodyWeight,
+          friendshipStatus: friendshipMap.get(user._id.toString()) || null,
+        }));
 
       res.json(results);
     } catch (error: any) {
@@ -68,6 +126,62 @@ router.get(
     }
   }
 );
+
+/** Usuarios sugeridos para enviar solicitud: excluye tú, amigos y cualquier solicitud (pendiente o ya resuelta con esa persona). */
+router.get('/suggestions', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const rawUserId = String((req as any).user.userId ?? '');
+    let userIdOid: mongoose.Types.ObjectId;
+    try {
+      userIdOid = new mongoose.Types.ObjectId(rawUserId);
+    } catch {
+      return res.json([]);
+    }
+
+    const friendships = await Friendship.find({
+      $or: [{ requester: userIdOid }, { recipient: userIdOid }],
+    })
+      .select('requester recipient')
+      .lean();
+
+    const exclude = new Set<string>([userIdOid.toString()]);
+    const selfStr = userIdOid.toString();
+    for (const f of friendships) {
+      const reqId = String(f.requester);
+      const recId = String(f.recipient);
+      const other = reqId === selfStr ? recId : recId === selfStr ? reqId : null;
+      if (other) exclude.add(other);
+    }
+
+    const excludeIds = [...exclude].map(id => new mongoose.Types.ObjectId(id));
+    const available = await User.countDocuments({
+      _id: { $nin: excludeIds },
+      ...REGISTERED_USER_MATCH,
+    });
+    if (available === 0) return res.json([]);
+
+    const sampleSize = Math.min(15, available);
+    const users = await User.aggregate([
+      { $match: { _id: { $nin: excludeIds }, ...REGISTERED_USER_MATCH } },
+      { $sample: { size: sampleSize } },
+      { $project: { name: 1, email: 1, username: 1, avatar: 1, bodyWeight: 1 } },
+    ]);
+
+    const results = users.map((user: any) => ({
+      id: user._id.toString(),
+      name: user.name || user.username || user.email,
+      email: user.email,
+      username: user.username,
+      avatar: user.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(user.name || user.username || user.email)}`,
+      bodyWeight: user.bodyWeight,
+      friendshipStatus: null,
+    }));
+
+    res.json(results);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
 // GET /api/social/friends/:friendId/routine - Obtener rutina activa de un amigo (solo amigos)
 router.get('/friends/:friendId/routine', authenticateToken, async (req: Request, res: Response) => {
@@ -151,9 +265,15 @@ router.get('/friends/:friendId/profile', authenticateToken, async (req: Request,
 router.get('/friends', authenticateToken, async (req: Request, res: Response) => {
   try {
     const userId = String((req as any).user.userId);
+    let userIdOid: mongoose.Types.ObjectId;
+    try {
+      userIdOid = new mongoose.Types.ObjectId(userId);
+    } catch {
+      return res.json([]);
+    }
 
     const friendships = await Friendship.find({
-      $or: [{ requester: userId }, { recipient: userId }],
+      $or: [{ requester: userIdOid }, { recipient: userIdOid }],
       status: 'accepted',
     }).lean();
 
@@ -193,10 +313,16 @@ router.get('/friends', authenticateToken, async (req: Request, res: Response) =>
 // GET /api/social/requests - Obtener solicitudes de amistad (pendientes recibidas)
 router.get('/requests', authenticateToken, async (req: Request, res: Response) => {
   try {
-    const userId = (req as any).user.userId;
+    const userId = String((req as any).user.userId ?? '');
+    let recipientOid: mongoose.Types.ObjectId;
+    try {
+      recipientOid = new mongoose.Types.ObjectId(userId);
+    } catch {
+      return res.json([]);
+    }
 
     const requests = await Friendship.find({
-      recipient: userId,
+      recipient: recipientOid,
       status: 'pending',
     })
       .populate('requester', 'name email avatar')
@@ -395,6 +521,115 @@ router.delete('/friends/:friendId', authenticateToken, async (req: Request, res:
     }
 
     res.json({ message: 'Amistad eliminada' });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/** Mejora % del agregado de rutina (primer vs último punto del historial de la rutina activa). */
+async function routineImprovementForUser(userOid: mongoose.Types.ObjectId): Promise<{
+  improvementPct: number | null;
+  snapshotCount: number;
+  routineName?: string;
+}> {
+  const routine = await Routine.findOne({ userId: userOid, isActive: true }).lean();
+  if (!routine) {
+    return { improvementPct: null, snapshotCount: 0, routineName: undefined };
+  }
+  const rid = routine._id instanceof mongoose.Types.ObjectId ? routine._id : new mongoose.Types.ObjectId(String(routine._id));
+  const history = await HistoryEntry.find({ userId: userOid, routineId: rid })
+    .sort({ dateISO: 1, year: 1, planWeek: 1, dayOfWeek: 1, createdAt: 1 })
+    .lean();
+  const name = String((routine as { name?: string }).name || 'Rutina');
+  if (history.length === 0) {
+    return { improvementPct: null, snapshotCount: 0, routineName: name };
+  }
+  if (history.length === 1) {
+    return { improvementPct: 0, snapshotCount: 1, routineName: name };
+  }
+  const first = history[0] as { total?: number };
+  const last = history[history.length - 1] as { total?: number };
+  const t0 = Number(first.total) || 0;
+  const t1 = Number(last.total) || 0;
+  let improvementPct: number;
+  if (t0 <= 0) {
+    improvementPct = t1 > t0 ? 100 : 0;
+  } else {
+    improvementPct = Math.round(((t1 - t0) / t0) * 100);
+  }
+  return { improvementPct, snapshotCount: history.length, routineName: name };
+}
+
+// GET /api/social/friends/routine-progress — ranking de mejora de rutina (tú + amigos)
+router.get('/friends/routine-progress', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const userId = String((req as any).user.userId ?? '');
+    let userIdOid: mongoose.Types.ObjectId;
+    try {
+      userIdOid = new mongoose.Types.ObjectId(userId);
+    } catch {
+      return res.json({ entries: [] });
+    }
+
+    const friendships = await Friendship.find({
+      $or: [{ requester: userIdOid }, { recipient: userIdOid }],
+      status: 'accepted',
+    }).lean();
+
+    const friendIdSet = new Set<string>();
+    for (const f of friendships) {
+      const reqId = String((f.requester as any)?.toString?.() ?? f.requester);
+      const recId = String((f.recipient as any)?.toString?.() ?? f.recipient);
+      const otherId = reqId === userId ? recId : recId === userId ? reqId : null;
+      if (otherId && otherId !== userId) friendIdSet.add(otherId);
+    }
+    const friendIds = Array.from(friendIdSet);
+
+    const targetIds = [userId, ...friendIds];
+
+    const users = await User.find({ _id: { $in: targetIds.map(id => new mongoose.Types.ObjectId(id)) } })
+      .select('name email avatar')
+      .lean();
+
+    const userMap = new Map(users.map((u: any) => [String(u._id), u]));
+
+    const entries: Array<{
+      userId: string;
+      name: string;
+      avatar: string;
+      isSelf: boolean;
+      routineName?: string;
+      snapshotCount: number;
+      improvementPct: number | null;
+    }> = [];
+
+    for (const oid of targetIds) {
+      const uid = new mongoose.Types.ObjectId(oid);
+      const u = userMap.get(oid);
+      const name = u?.name || u?.email || 'Usuario';
+      const avatar = u?.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(name)}`;
+      const stats = await routineImprovementForUser(uid);
+      entries.push({
+        userId: oid,
+        name,
+        avatar,
+        isSelf: oid === userId,
+        routineName: stats.routineName,
+        snapshotCount: stats.snapshotCount,
+        improvementPct: stats.improvementPct,
+      });
+    }
+
+    entries.sort((a, b) => {
+      const ap = a.improvementPct;
+      const bp = b.improvementPct;
+      const av = ap == null ? -1e9 : ap;
+      const bv = bp == null ? -1e9 : bp;
+      if (bv !== av) return bv - av;
+      return a.name.localeCompare(b.name, 'es');
+    });
+
+    res.json({ entries });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }

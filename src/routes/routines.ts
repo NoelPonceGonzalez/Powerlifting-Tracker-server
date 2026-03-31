@@ -63,6 +63,7 @@ router.post(
         isActive,
         sameTemplateAllWeeks: req.body.sameTemplateAllWeeks !== false,
         hiddenFromSocial: !!req.body.hiddenFromSocial,
+        cycleLength: Number.isFinite(req.body.cycleLength) ? Math.max(1, Math.min(52, req.body.cycleLength)) : 4,
       });
 
       const rid = oid(routine._id);
@@ -93,6 +94,12 @@ router.patch('/:id/plan', authenticateToken, async (req: Request, res: Response)
 
     if (sameTemplateAllWeeks !== undefined) routine.sameTemplateAllWeeks = !!sameTemplateAllWeeks;
     if (hiddenFromSocial !== undefined) routine.hiddenFromSocial = !!hiddenFromSocial;
+    if (req.body.cycleLength !== undefined && Number.isFinite(req.body.cycleLength)) {
+      (routine as any).cycleLength = Math.max(1, Math.min(52, req.body.cycleLength));
+    }
+    if (Array.isArray(req.body.skippedWeeks)) {
+      (routine as any).skippedWeeks = req.body.skippedWeeks.filter((w: any) => Number.isFinite(w));
+    }
     await routine.save();
 
     const rid = oid(routine._id);
@@ -105,7 +112,6 @@ router.patch('/:id/plan', authenticateToken, async (req: Request, res: Response)
       await pruneWorkoutDataAfterPlanChange(rid);
     }
 
-    /** Devuelve la rutina ensamblada para que el cliente actualice estado y _dbId sin otro GET. */
     res.json(await assembleFullRoutine(routine));
   } catch (error: any) {
     res.status(500).json({ error: error.message });
@@ -405,6 +411,12 @@ router.put(
       if (name !== undefined) routine.name = name;
       if (sameTemplateAllWeeks !== undefined) routine.sameTemplateAllWeeks = !!sameTemplateAllWeeks;
       if (hiddenFromSocial !== undefined) routine.hiddenFromSocial = !!hiddenFromSocial;
+      if (req.body.cycleLength !== undefined && Number.isFinite(req.body.cycleLength)) {
+        (routine as any).cycleLength = Math.max(1, Math.min(52, req.body.cycleLength));
+      }
+      if (Array.isArray(req.body.skippedWeeks)) {
+        (routine as any).skippedWeeks = req.body.skippedWeeks.filter((w: any) => Number.isFinite(w));
+      }
 
       if (isActive === true) {
         await Routine.updateMany({ userId, _id: { $ne: req.params.id } }, { isActive: false });
