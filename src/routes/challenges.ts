@@ -14,6 +14,7 @@ import {
   type Gender,
 } from '../utils/challengeScoring';
 import { getBodyWeightAndGenderFromParticipant } from '../utils/challengeParticipantUtils';
+import { broadcastSse } from '../utils/sse';
 
 const router = express.Router();
 
@@ -197,6 +198,8 @@ router.post(
         }
       }
 
+      broadcastSse([userId, ...friendIds.map(f => f.toString())], 'challenge_update');
+
       const created = await Challenge.findById(challenge._id)
         .populate('createdBy', 'name email avatar')
         .populate('participants.userId', 'name email avatar bodyWeight gender');
@@ -344,6 +347,10 @@ router.put(
           console.error('[PUSH] Error challenge_join:', e);
         }
       }
+
+      const participantIds = challenge.participants.map(p => p.userId.toString());
+      if (!participantIds.includes(creatorId)) participantIds.push(creatorId);
+      broadcastSse(participantIds, 'challenge_update');
 
       const updated = await Challenge.findById(challenge._id)
         .populate('createdBy', 'name email avatar')

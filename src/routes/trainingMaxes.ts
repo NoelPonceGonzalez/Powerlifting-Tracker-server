@@ -8,6 +8,7 @@ import { body, query, validationResult } from 'express-validator';
 import { calendarMonth1FromDateISO, dateISOFromYearWeekDay } from '../utils/calendarWeekDate';
 import { HistoryTmSnapshot } from '../models/HistoryTmSnapshot';
 import { saveHistoryTmSnapshots, loadHistoryTmSnapshotsAsRecord } from '../utils/assembleRoutine';
+import { broadcastSse } from '../utils/sse';
 
 const router = express.Router();
 
@@ -129,6 +130,7 @@ router.post(
         );
       }
       const out = await TrainingMax.findById(trainingMax._id);
+      broadcastSse([userId.toString()], 'routine_update');
       res.status(201).json(out ?? trainingMax);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -187,6 +189,7 @@ router.put(
       if (!updated) {
         return res.status(404).json({ error: 'Training Max no encontrado en esta rutina' });
       }
+      broadcastSse([userId.toString()], 'routine_update');
       res.json(updated);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -222,6 +225,7 @@ router.delete(
         return res.status(404).json({ error: 'Training Max no encontrado en esta rutina' });
       }
       await HistoryTmSnapshot.deleteMany({ trainingMaxId: trainingMax._id });
+      broadcastSse([userId.toString()], 'routine_update');
       res.json({ message: 'Training Max eliminado' });
     } catch (error: any) {
       res.status(500).json({ error: error.message });

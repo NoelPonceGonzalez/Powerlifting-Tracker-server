@@ -4,6 +4,7 @@ import { GymCheckIn } from '../models/GymCheckIn';
 import { Notification } from '../models/Notification';
 import { Friendship } from '../models/Friendship';
 import { body, validationResult } from 'express-validator';
+import { broadcastSse } from '../utils/sse';
 
 const router = express.Router();
 
@@ -106,6 +107,8 @@ router.post(
         }
       }
 
+      broadcastSse([userId, ...friendIds], 'checkin_update');
+
       res.status(201).json(checkIn);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -175,6 +178,8 @@ router.put(
           console.error('[PUSH] Error gym_checkin edit:', e);
         }
       }
+      broadcastSse([userId, ...friendIds], 'checkin_update');
+
       res.json(checkIn);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -190,6 +195,18 @@ router.delete('/:id', authenticateToken, async (req: Request, res: Response) => 
     const checkIn = await GymCheckIn.findOne({ _id: req.params.id, userId });
     if (!checkIn) return res.status(404).json({ error: 'Check-in no encontrado' });
     await GymCheckIn.deleteOne({ _id: req.params.id, userId });
+
+    const friendships = await Friendship.find({
+      $or: [{ requester: userId }, { recipient: userId }],
+      status: 'accepted',
+    });
+    const friendIds = friendships.map(f => {
+      const reqStr = f.requester.toString();
+      const recStr = f.recipient.toString();
+      return reqStr === String(userId) ? recStr : reqStr;
+    });
+    broadcastSse([String(userId), ...friendIds], 'checkin_update');
+
     res.status(204).send();
   } catch (error: any) {
     res.status(500).json({ error: error.message });

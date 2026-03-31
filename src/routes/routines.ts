@@ -13,6 +13,7 @@ import { WorkoutSession } from '../models/WorkoutSession';
 import { WorkoutExercise } from '../models/WorkoutExercise';
 import { WorkoutSet } from '../models/WorkoutSet';
 import { body, validationResult } from 'express-validator';
+import { broadcastSse } from '../utils/sse';
 import {
   assembleFullRoutine,
   assembleRoutinePlan,
@@ -76,6 +77,7 @@ router.post(
       await pruneWorkoutDataAfterPlanChange(rid);
 
       const assembled = await assembleFullRoutine(routine);
+      broadcastSse([userId], 'routine_update');
       res.status(201).json(assembled);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -112,6 +114,7 @@ router.patch('/:id/plan', authenticateToken, async (req: Request, res: Response)
       await pruneWorkoutDataAfterPlanChange(rid);
     }
 
+    broadcastSse([userId], 'routine_update');
     res.json(await assembleFullRoutine(routine));
   } catch (error: any) {
     res.status(500).json({ error: error.message });
@@ -446,6 +449,7 @@ router.put(
         await disassembleLogsToCollections({ routineId: rid, userId: uid, logs });
       }
 
+      broadcastSse([userId], 'routine_update');
       res.json(await assembleFullRoutine(routine));
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -465,6 +469,7 @@ router.delete('/:id', authenticateToken, async (req: Request, res: Response) => 
     const heIds = (await HistoryEntry.find({ userId, routineId: rid }).select('_id').lean()).map((h) => oid(h._id));
     if (heIds.length > 0) await HistoryTmSnapshot.deleteMany({ historyEntryId: { $in: heIds } });
     await HistoryEntry.deleteMany({ userId, routineId: rid });
+    broadcastSse([userId], 'routine_update');
     res.json({ message: 'Rutina eliminada' });
   } catch (error: any) {
     res.status(500).json({ error: error.message });

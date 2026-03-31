@@ -14,6 +14,7 @@ import checkinsRoutes from './routes/checkins';
 import notificationsRoutes from './routes/notifications';
 import challengesRoutes from './routes/challenges';
 import internalExerciseMaxesRoutes from './routes/internalExerciseMaxes';
+import sseRoutes from './routes/sse';
 import { formatApiRequestLogLine } from './utils/apiRequestLogLabel';
 import { processFinishedChallengeWinnerNotifications } from './utils/challengeFinishedNotifications';
 
@@ -67,6 +68,7 @@ app.use('/api/checkins', checkinsRoutes);
 app.use('/api/notifications', notificationsRoutes);
 app.use('/api/challenges', challengesRoutes);
 app.use('/api/internal-exercise-maxes', internalExerciseMaxesRoutes);
+app.use('/api/sse', sseRoutes);
 
 // --- Interfaz web (React) en el mismo puerto: necesaria para la app Expo (WebView → GET /) ---
 if (existsSync(CLIENT_INDEX)) {

@@ -9,6 +9,7 @@ import { TrainingMax } from '../models/TrainingMax';
 import { HistoryEntry } from '../models/HistoryEntry';
 import { body, validationResult } from 'express-validator';
 import { assembleFullRoutine } from '../utils/assembleRoutine';
+import { broadcastSse } from '../utils/sse';
 
 const router = express.Router();
 
@@ -414,6 +415,8 @@ router.post(
         console.error('[PUSH] Error friend_request:', e);
       }
 
+      broadcastSse([requesterId, recipientId], 'social_update');
+
       res.status(201).json(friendship);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -466,6 +469,8 @@ router.put('/requests/:id/accept', authenticateToken, async (req: Request, res: 
       console.error('[PUSH] Error friend_accepted:', e);
     }
 
+    broadcastSse([userId, friendship.requester.toString()], 'social_update');
+
     res.json(friendship);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
@@ -491,6 +496,8 @@ router.put('/requests/:id/reject', authenticateToken, async (req: Request, res: 
     if (!friendship) {
       return res.status(404).json({ error: 'Solicitud no encontrada' });
     }
+
+    broadcastSse([userId, friendship.requester.toString()], 'social_update');
 
     res.json(friendship);
   } catch (error: any) {
@@ -519,6 +526,8 @@ router.delete('/friends/:friendId', authenticateToken, async (req: Request, res:
     if (result.deletedCount === 0) {
       return res.status(404).json({ error: 'No existe amistad con este usuario' });
     }
+
+    broadcastSse([userId, friendId], 'social_update');
 
     res.json({ message: 'Amistad eliminada' });
   } catch (error: any) {

@@ -5,6 +5,7 @@ import { logger } from './logger';
 import { computeDisplayScoreForChallengeParticipant } from './challengeScoring';
 import { getBodyWeightAndGenderFromParticipant } from './challengeParticipantUtils';
 import { sendPushToUsers } from './push';
+import { broadcastSse } from './sse';
 
 type RankRow = {
   userId: string;
@@ -128,6 +129,8 @@ async function processOneChallenge(challenge: any): Promise<void> {
   } catch (e) {
     logger.error('[challenge_winner] push', e);
   }
+
+  broadcastSse(userIds, 'challenge_update');
 
   await Challenge.updateOne({ _id: c._id }, { $set: { winnerNotifiedAt: new Date() } });
 }

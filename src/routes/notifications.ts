@@ -5,6 +5,7 @@ import { User } from '../models/User';
 import { Friendship } from '../models/Friendship';
 import { body, validationResult } from 'express-validator';
 import { sendPushToUser } from '../utils/push';
+import { broadcastSse } from '../utils/sse';
 
 const router = express.Router();
 
@@ -94,6 +95,8 @@ router.post(
       } catch (e) {
         console.error('[PUSH] Error same-time:', e);
       }
+      broadcastSse([String(friendUserId), String(fromUserId)], 'checkin_update');
+
       res.status(201).json({ message: 'Notificación enviada' });
     } catch (error: any) {
       res.status(500).json({ error: error.message });
