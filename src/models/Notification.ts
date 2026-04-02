@@ -6,7 +6,8 @@ export type NotificationType =
   | 'challenge_invite'
   | 'challenge_join'
   | 'challenge_winner'
-  | 'friend_accepted';
+  | 'friend_accepted'
+  | 'new_rm';
 
 export interface INotification extends Document {
   userId: mongoose.Types.ObjectId; // Usuario que recibe la notificación
@@ -36,6 +37,7 @@ const NotificationSchema = new Schema<INotification>(
         'challenge_join',
         'challenge_winner',
         'friend_accepted',
+        'new_rm',
       ],
       required: true,
     },

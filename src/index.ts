@@ -126,6 +126,28 @@ const startServer = async () => {
   try {
     logger.info('Iniciando servidor...');
     await connectDB();
+
+    const { GymCheckIn } = await import('./models/GymCheckIn');
+    const { computeCheckInExpiresAt } = await import('./utils/checkInExpires');
+    const legacyCheckIns = await GymCheckIn.find({ expiresAt: { $exists: false } })
+      .select('_id timestamp time')
+      .lean()
+      .exec();
+    for (const doc of legacyCheckIns) {
+      await GymCheckIn.updateOne(
+        { _id: doc._id },
+        {
+          $set: {
+            expiresAt: computeCheckInExpiresAt(new Date(doc.timestamp as Date), String(doc.time)),
+          },
+        }
+      );
+    }
+    if (legacyCheckIns.length > 0) {
+      logger.info(`GymCheckIn: backfill expiresAt en ${legacyCheckIns.length} documento(s)`);
+    }
+
+    await GymCheckIn.syncIndexes().catch(e => logger.warn('syncIndexes GymCheckIn', e));
     
     const server = app.listen(Number(config.port), '0.0.0.0', () => {
       const startupMessage = `Servidor corriendo en puerto ${config.port}`;

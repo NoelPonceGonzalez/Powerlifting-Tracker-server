@@ -9,6 +9,9 @@ import { calendarMonth1FromDateISO, dateISOFromYearWeekDay } from '../utils/cale
 import { HistoryTmSnapshot } from '../models/HistoryTmSnapshot';
 import { saveHistoryTmSnapshots, loadHistoryTmSnapshotsAsRecord } from '../utils/assembleRoutine';
 import { broadcastSse } from '../utils/sse';
+import { Friendship } from '../models/Friendship';
+import { Notification } from '../models/Notification';
+import { sendPushToUsers } from '../utils/push';
 
 const router = express.Router();
 
@@ -171,6 +174,9 @@ router.put(
         return res.status(404).json({ error: 'Training Max no encontrado en esta rutina' });
       }
 
+      const prevValue = trainingMax.value;
+      const prevName = trainingMax.name;
+
       const $set: Record<string, unknown> = {};
       if (name !== undefined) $set.name = name;
       if (value !== undefined) $set.value = value;
@@ -190,6 +196,44 @@ router.put(
         return res.status(404).json({ error: 'Training Max no encontrado en esta rutina' });
       }
       broadcastSse([userId.toString()], 'routine_update');
+
+      const newValue = typeof value === 'number' ? value : typeof value === 'string' ? parseFloat(value) : NaN;
+      if (Number.isFinite(newValue) && newValue > prevValue) {
+        (async () => {
+          try {
+            const friendships = await Friendship.find({
+              $or: [{ requester: userId, status: 'accepted' }, { recipient: userId, status: 'accepted' }],
+            });
+            const friendIds = friendships.map(f => {
+              const reqStr = f.requester.toString();
+              const recStr = f.recipient.toString();
+              return reqStr === userId.toString() ? recStr : reqStr;
+            });
+            if (friendIds.length === 0) return;
+
+            const user = await (await import('../models/User')).User.findById(userId).select('name');
+            const userName = user?.name || 'Un amigo';
+            const exName = (name ?? prevName) || 'un ejercicio';
+            const modeLabel = (updated.mode === 'weight' ? 'kg' : updated.mode === 'reps' ? 'reps' : 's');
+            const notifTitle = `${userName} ha batido su RM`;
+            const notifMessage = `${exName}: ${newValue} ${modeLabel} (antes ${prevValue} ${modeLabel})`;
+
+            const notifications = friendIds.map(fid => ({
+              userId: fid,
+              type: 'new_rm' as const,
+              title: notifTitle,
+              message: notifMessage,
+              relatedUserId: userId,
+              relatedData: { exerciseName: exName, newValue, prevValue, mode: updated.mode },
+            }));
+            await Notification.insertMany(notifications);
+            await sendPushToUsers(friendIds, notifTitle, notifMessage, { type: 'new_rm', exerciseName: exName });
+          } catch (e) {
+            console.error('[PUSH] Error new_rm notification:', e);
+          }
+        })();
+      }
+
       res.json(updated);
     } catch (error: any) {
       res.status(500).json({ error: error.message });

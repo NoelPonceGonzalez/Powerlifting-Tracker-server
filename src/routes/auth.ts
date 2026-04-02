@@ -647,6 +647,7 @@ router.post(
           avatar: user.avatar || '',
           theme: user.theme ?? undefined,
           progressMode: user.progressMode ?? undefined,
+          mbMode: !!user.mbMode,
         },
       });
     } catch (error: any) {
@@ -818,6 +819,7 @@ router.post(
           avatar: user.avatar || '',
           theme: user.theme ?? undefined,
           progressMode: user.progressMode ?? undefined,
+          mbMode: !!user.mbMode,
         },
       });
     } catch (error: any) {
@@ -871,6 +873,7 @@ router.get('/me', authenticateToken, async (req: AuthRequest, res: Response) => 
         avatar: user.avatar,
         theme: user.theme,
         progressMode: user.progressMode ?? undefined,
+        mbMode: !!user.mbMode,
         emailVerified: user.emailVerified,
       }
     });
@@ -880,12 +883,24 @@ router.get('/me', authenticateToken, async (req: AuthRequest, res: Response) => 
   }
 });
 
-// 6. Logout — limpiar pushToken para no enviar notificaciones al dispositivo anterior.
+// 6. Logout — quitar solo el token de este dispositivo (body.token) o todos si no se envía (clientes antiguos).
 router.post('/logout', authenticateToken, async (req: Request, res: Response) => {
   try {
     const userId = (req as AuthRequest).userId || (req as any).user?.userId;
     if (userId) {
-      await User.findByIdAndUpdate(userId, { $unset: { pushToken: '' } });
+      const bodyToken =
+        typeof req.body?.token === 'string' ? req.body.token.trim() : '';
+      if (bodyToken) {
+        const u = await User.findById(userId).select('pushToken pushTokens');
+        if (u) {
+          await User.findByIdAndUpdate(userId, { $pull: { pushTokens: bodyToken } });
+          if (u.pushToken === bodyToken) {
+            await User.findByIdAndUpdate(userId, { $unset: { pushToken: '' } });
+          }
+        }
+      } else {
+        await User.findByIdAndUpdate(userId, { $set: { pushTokens: [] }, $unset: { pushToken: '' } });
+      }
     }
   } catch {
     /* best-effort */
@@ -900,7 +915,7 @@ router.put('/me', authenticateToken, async (req: AuthRequest, res: Response) => 
     if (!user) {
       return res.status(404).json({ error: 'Usuario no encontrado' });
     }
-    const { theme, name, bodyWeight, avatar, progressMode } = req.body;
+    const { theme, name, bodyWeight, avatar, progressMode, mbMode } = req.body;
     if (theme !== undefined) {
       if (theme === 'light' || theme === 'dark') {
         user.theme = theme;
@@ -914,6 +929,9 @@ router.put('/me', authenticateToken, async (req: AuthRequest, res: Response) => 
         user.progressMode = progressMode;
       }
     }
+    if (mbMode !== undefined) {
+      user.mbMode = !!mbMode;
+    }
     await user.save();
     res.json({
       user: {
@@ -926,6 +944,7 @@ router.put('/me', authenticateToken, async (req: AuthRequest, res: Response) => 
         avatar: user.avatar || '',
         theme: user.theme ?? undefined,
         progressMode: user.progressMode ?? undefined,
+        mbMode: !!user.mbMode,
         emailVerified: user.emailVerified,
       },
     });

@@ -21,6 +21,18 @@ function getExpo(): Expo {
 
 const ANDROID_CHANNEL_ID = 'default';
 
+/** Tokens Expo válidos: campo legacy `pushToken` + array `pushTokens` (varios dispositivos). */
+export function collectValidExpoTokens(user: {
+  pushToken?: string | null;
+  pushTokens?: string[] | null;
+}): string[] {
+  const raw = [...(user.pushTokens || []), user.pushToken].filter(
+    (x): x is string => typeof x === 'string' && x.trim().length > 0
+  );
+  const valid = raw.filter((t) => Expo.isExpoPushToken(t));
+  return [...new Set(valid)];
+}
+
 function buildPushDataPayload(data?: Record<string, any>): Record<string, string> {
   const type = String(data?.type ?? '');
   let tab: 'friends' | 'challenges' | 'checkins' = 'checkins';
@@ -28,6 +40,8 @@ function buildPushDataPayload(data?: Record<string, any>): Record<string, string
     tab = 'friends';
   } else if (type === 'challenge_invite' || type === 'challenge_join' || type === 'challenge_winner') {
     tab = 'challenges';
+  } else if (type === 'new_rm') {
+    tab = 'friends';
   } else if (
     type === 'gym_checkin' ||
     type === 'same_time_confirmation' ||
@@ -108,32 +122,36 @@ export async function sendPushToUser(
   data?: Record<string, any>
 ): Promise<void> {
   try {
-    const user = await User.findById(userId).select('pushToken');
-    const token = user?.pushToken;
-    if (!token || !Expo.isExpoPushToken(token)) {
+    const user = await User.findById(userId).select('pushToken pushTokens');
+    const tokens = user ? collectValidExpoTokens(user) : [];
+    if (tokens.length === 0) {
       console.warn('[PUSH] Usuario sin token válido:', userId, '(build EAS + permisos + login)');
       return;
     }
 
     const client = getExpo();
-    const message: ExpoPushMessage = {
-      to: token,
+    const payloadData = buildPushDataPayload(data);
+    const messages: ExpoPushMessage[] = tokens.map((to) => ({
+      to,
       sound: 'default',
       title,
       body,
       channelId: ANDROID_CHANNEL_ID,
-      data: buildPushDataPayload(data),
+      data: payloadData,
       priority: 'high',
       ttl: 86400,
       badge: 1,
-    };
-    const tickets = await client.sendPushNotificationsAsync([message]);
-    collectTicketIds(tickets);
-    const ticket = tickets[0];
-    if (ticket?.status === 'error') {
-      console.error('[PUSH] Error ticket para', userId, (ticket as any).message, (ticket as any).details);
-    } else {
-      console.log('[PUSH] Enviado a', userId, ':', title);
+    }));
+    const chunks = client.chunkPushNotifications(messages);
+    for (const chunk of chunks) {
+      const tickets = await client.sendPushNotificationsAsync(chunk);
+      collectTicketIds(tickets);
+      const errors = tickets.filter((t: any) => t?.status === 'error');
+      if (errors.length > 0) {
+        console.error('[PUSH] Error ticket para', userId, errors.map((e: any) => (e as any).message));
+      } else {
+        console.log('[PUSH] Enviado a', userId, `(${tokens.length} disp.):`, title);
+      }
     }
   } catch (err) {
     console.error('[PUSH] Error enviando a usuario', userId, err);
@@ -147,12 +165,11 @@ export async function sendPushToUsers(
   data?: Record<string, any>
 ): Promise<void> {
   if (userIds.length === 0) return;
-  const users = await User.find({ _id: { $in: userIds } }).select('pushToken');
-  const tokens = users
-    .map((u) => u.pushToken)
-    .filter((t): t is string => !!t && typeof t === 'string' && t.trim().length > 0 && Expo.isExpoPushToken(t));
+  const users = await User.find({ _id: { $in: userIds } }).select('pushToken pushTokens');
+  const allTokens = users.flatMap((u) => collectValidExpoTokens(u));
+  const tokens = [...new Set(allTokens)];
 
-  const withoutToken = users.filter((u) => !u.pushToken || !Expo.isExpoPushToken(u.pushToken));
+  const withoutToken = users.filter((u) => collectValidExpoTokens(u).length === 0);
   if (withoutToken.length > 0) {
     console.warn(
       '[PUSH] Sin token válido:',
@@ -164,6 +181,9 @@ export async function sendPushToUsers(
       '[PUSH] Ningún token válido. Requisitos: APK/IPA EAS (no Expo Go), permisos, sesión iniciada.'
     );
     return;
+  }
+  if (allTokens.length !== tokens.length) {
+    console.log(`[PUSH] Dedup: ${allTokens.length} → ${tokens.length} tokens únicos (multi-cuenta mismo dispositivo)`);
   }
 
   try {

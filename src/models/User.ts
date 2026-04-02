@@ -9,13 +9,18 @@ export interface IUser extends Document {
   avatar?: string;
   bodyWeight?: number;
   theme?: 'light' | 'dark';
+  /** Acento rosa (MB) en toda la UI; independiente de claro/oscuro. */
+  mbMode?: boolean;
   progressMode?: 'month' | 'year';
   emailVerified: boolean;
   verificationToken?: string;
   verificationTokenExpires?: Date;
   resetPasswordToken?: string;
   resetPasswordExpires?: Date;
+  /** @deprecated Usar pushTokens; se mantiene por migración desde clientes antiguos. */
   pushToken?: string;
+  /** Tokens Expo por dispositivo (varios móviles/tablets por cuenta). */
+  pushTokens?: string[];
   createdAt: Date;
   updatedAt: Date;
 }
@@ -67,6 +72,10 @@ const UserSchema = new Schema<IUser>(
       type: String,
       enum: ['month', 'year'],
     },
+    mbMode: {
+      type: Boolean,
+      default: false,
+    },
     emailVerified: {
       type: Boolean,
       default: false,
@@ -86,6 +95,10 @@ const UserSchema = new Schema<IUser>(
     pushToken: {
       type: String,
       default: null,
+    },
+    pushTokens: {
+      type: [String],
+      default: [],
     },
   },
   {

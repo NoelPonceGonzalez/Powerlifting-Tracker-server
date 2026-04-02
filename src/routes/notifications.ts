@@ -22,8 +22,17 @@ router.put(
       }
       const userId = (req as AuthRequest).userId || (req as any).user?.userId;
       if (!userId) return res.status(401).json({ error: 'Usuario no autenticado' });
-      const { token } = req.body;
-      await User.findByIdAndUpdate(userId, { pushToken: token });
+      const token = String(req.body.token).trim();
+      const user = await User.findById(userId).select('pushToken pushTokens');
+      if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
+      const merged = [
+        ...new Set(
+          [...(user.pushTokens || []), user.pushToken, token].filter(
+            (x): x is string => typeof x === 'string' && x.length > 0
+          )
+        ),
+      ];
+      await User.findByIdAndUpdate(userId, { pushTokens: merged, $unset: { pushToken: '' } });
       res.json({ message: 'Token registrado' });
     } catch (error: any) {
       res.status(500).json({ error: error.message });

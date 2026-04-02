@@ -13,6 +13,10 @@ export interface IRoutine extends Document {
   hiddenFromSocial?: boolean;
   cycleLength?: number;
   skippedWeeks?: number[];
+  /** ISO: desde aquí los % de progreso en gráficos usan este punto como referencia (no modifica TM). */
+  progressCheckpointAt?: Date;
+  /** Snapshot de TM al momento del checkpoint ({ tmId: valor }). El baseline de % se toma de aquí. */
+  progressCheckpointTms?: Record<string, number>;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -52,6 +56,14 @@ const RoutineSchema = new Schema<IRoutine>(
     skippedWeeks: {
       type: [Number],
       default: [],
+    },
+    progressCheckpointAt: {
+      type: Date,
+      default: undefined,
+    },
+    progressCheckpointTms: {
+      type: Schema.Types.Mixed,
+      default: undefined,
     },
   },
   {

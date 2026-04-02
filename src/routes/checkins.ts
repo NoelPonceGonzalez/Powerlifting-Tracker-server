@@ -228,11 +228,11 @@ router.get('/', authenticateToken, async (req: Request, res: Response) => {
       f.requester.toString() === userId ? f.recipient : f.requester
     );
 
-    // Obtener check-ins de amigos y propios (últimas 24 horas)
-    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    // Solo check-ins aún vigentes: se borran en Mongo ~3 h después de la hora de entreno (campo expiresAt).
+    const now = new Date();
     const checkIns = await GymCheckIn.find({
       userId: { $in: [...friendIds, userId] },
-      timestamp: { $gte: oneDayAgo },
+      expiresAt: { $gt: now },
     })
       .populate('userId', 'name email avatar')
       .sort({ timestamp: -1 })
@@ -260,6 +260,7 @@ router.get('/', authenticateToken, async (req: Request, res: Response) => {
         gymName: ci.gymName,
         time: ci.time,
         timestamp: ci.timestamp.getTime(),
+        expiresAt: ci.expiresAt ? ci.expiresAt.getTime() : undefined,
       };
     });
 

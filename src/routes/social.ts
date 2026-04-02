@@ -241,7 +241,9 @@ router.get('/friends/:friendId/profile', authenticateToken, async (req: Request,
     if (!friend) return res.status(404).json({ error: 'Usuario no encontrado' });
 
     const activeRoutine = await Routine.findOne({ userId: friendId, isActive: true }).select('_id').lean();
-    const tms = activeRoutine?._id
+    const includeAllTms = String(req.query.includeAllTms || '') === '1' || String(req.query.includeAllTms || '') === 'true';
+
+    const sharedTms = activeRoutine?._id
       ? await TrainingMax.find({
           userId: friendId,
           routineId: activeRoutine._id,
@@ -252,10 +254,30 @@ router.get('/friends/:friendId/profile', authenticateToken, async (req: Request,
           .lean()
       : [];
 
+    const allTms =
+      includeAllTms && activeRoutine?._id
+        ? await TrainingMax.find({
+            userId: friendId,
+            routineId: activeRoutine._id,
+          })
+            .select('name mode linkedExercise')
+            .sort({ createdAt: 1 })
+            .lean()
+        : [];
+
     res.json({
       name: friend.name || 'Usuario',
       avatar: friend.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(friend.name || 'U')}`,
-      trainingMaxes: tms.map((t: any) => ({ name: t.name, value: t.value, mode: t.mode })),
+      trainingMaxes: sharedTms.map((t: any) => ({ name: t.name, value: t.value, mode: t.mode })),
+      ...(includeAllTms
+        ? {
+            trainingMaxesAll: allTms.map((t: any) => ({
+              name: t.name,
+              mode: t.mode,
+              ...(t.linkedExercise ? { linkedExercise: t.linkedExercise } : {}),
+            })),
+          }
+        : {}),
     });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
@@ -535,7 +557,19 @@ router.delete('/friends/:friendId', authenticateToken, async (req: Request, res:
   }
 });
 
-/** Mejora % del agregado de rutina (primer vs último punto del historial de la rutina activa). */
+function computeAggregate(tms: Array<{ value: number; mode: string }>): number {
+  const w = tms.filter(t => t.mode === 'weight');
+  const r = tms.filter(t => t.mode === 'reps');
+  const s = tms.filter(t => t.mode === 'seconds');
+  const sumW = w.reduce((a, t) => a + (t.value || 0), 0);
+  const sumR = r.reduce((a, t) => a + (t.value || 0), 0);
+  const sumS = s.reduce((a, t) => a + (t.value || 0), 0);
+  const nModes = [w.length > 0, r.length > 0, s.length > 0].filter(Boolean).length;
+  if (nModes <= 1) return sumW + sumR + sumS;
+  return Math.round((sumW + sumR / 5 + sumS / 60) * 100) / 100;
+}
+
+/** Mejora % de la rutina: primer snapshot del historial vs TM actuales (vivos). */
 async function routineImprovementForUser(userOid: mongoose.Types.ObjectId): Promise<{
   improvementPct: number | null;
   snapshotCount: number;
@@ -550,16 +584,18 @@ async function routineImprovementForUser(userOid: mongoose.Types.ObjectId): Prom
     .sort({ dateISO: 1, year: 1, planWeek: 1, dayOfWeek: 1, createdAt: 1 })
     .lean();
   const name = String((routine as { name?: string }).name || 'Rutina');
+
+  const currentTms = await TrainingMax.find({ userId: userOid, routineId: rid }).lean();
+  const currentTotal = computeAggregate(currentTms.map(t => ({ value: t.value, mode: t.mode })));
+
   if (history.length === 0) {
-    return { improvementPct: null, snapshotCount: 0, routineName: name };
+    return { improvementPct: currentTotal > 0 ? 0 : null, snapshotCount: 0, routineName: name };
   }
-  if (history.length === 1) {
-    return { improvementPct: 0, snapshotCount: 1, routineName: name };
-  }
+
   const first = history[0] as { total?: number };
-  const last = history[history.length - 1] as { total?: number };
   const t0 = Number(first.total) || 0;
-  const t1 = Number(last.total) || 0;
+  const t1 = currentTotal;
+
   let improvementPct: number;
   if (t0 <= 0) {
     improvementPct = t1 > t0 ? 100 : 0;

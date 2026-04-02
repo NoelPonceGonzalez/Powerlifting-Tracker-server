@@ -420,6 +420,28 @@ router.put(
       if (Array.isArray(req.body.skippedWeeks)) {
         (routine as any).skippedWeeks = req.body.skippedWeeks.filter((w: any) => Number.isFinite(w));
       }
+      if (req.body.progressCheckpointAt !== undefined) {
+        const raw = req.body.progressCheckpointAt;
+        if (raw === null || raw === '') {
+          (routine as any).progressCheckpointAt = undefined;
+          (routine as any).progressCheckpointTms = undefined;
+        } else {
+          const d = new Date(String(raw));
+          (routine as any).progressCheckpointAt = Number.isNaN(d.getTime()) ? undefined : d;
+        }
+      }
+      if (req.body.progressCheckpointTms !== undefined) {
+        const raw = req.body.progressCheckpointTms;
+        if (raw === null) {
+          (routine as any).progressCheckpointTms = undefined;
+        } else if (typeof raw === 'object' && !Array.isArray(raw)) {
+          const clean: Record<string, number> = {};
+          for (const [k, v] of Object.entries(raw)) {
+            if (typeof v === 'number' && Number.isFinite(v)) clean[k] = v;
+          }
+          (routine as any).progressCheckpointTms = Object.keys(clean).length > 0 ? clean : undefined;
+        }
+      }
 
       if (isActive === true) {
         await Routine.updateMany({ userId, _id: { $ne: req.params.id } }, { isActive: false });

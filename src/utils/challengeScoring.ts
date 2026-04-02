@@ -54,8 +54,9 @@ export function isPullUpLikeExercise(exercise: string): boolean {
   return /(dominad|pull[\s-]?up|chin|muscle|tracci[oó]n|barra fija)/i.test(exercise);
 }
 
+/** Solo reps y segundos: +25 % al score para género mujer (no aplica a torneos por peso IPF GL). */
 function genderFactor(gender?: Gender): number {
-  return gender === 'mujer' ? 1.15 : 1;
+  return gender === 'mujer' ? 1.25 : 1;
 }
 
 const REF_BW = 70;
