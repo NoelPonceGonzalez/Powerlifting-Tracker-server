@@ -262,6 +262,20 @@ interface DisassemblePlanInput {
   baseTemplate?: any[];
   weekTypeOverrides?: any[];
   versions?: any[];
+  /** Longitud del ciclo (1–52). Antes se asumía 4 y se perdían semanas de mesociclos mayores. */
+  cycleLength?: number;
+}
+
+function inferCycleLengthCl(input: DisassemblePlanInput, rawTemplate: any[]): number {
+  if (Number.isFinite(input.cycleLength) && input.cycleLength! >= 1) {
+    return Math.max(1, Math.min(52, input.cycleLength!));
+  }
+  if (rawTemplate.length > 0) {
+    const nums = rawTemplate.map((w) => Number(w.number ?? w.slot ?? 1)).filter((n) => Number.isFinite(n) && n >= 1);
+    const mx = Math.max(...nums, rawTemplate.length, 1);
+    return Math.max(1, Math.min(52, mx));
+  }
+  return 4;
 }
 
 /** Borra el plan viejo y guarda el nuevo en colecciones normalizadas. */
@@ -287,12 +301,20 @@ export async function disassemblePlanToCollections(input: DisassemblePlanInput) 
   const rawTemplate = resolveTemplateSource(input);
   if (rawTemplate.length === 0) return;
 
+  const cl = inferCycleLengthCl(input, rawTemplate);
   const bySlot = new Map<number, any>();
   for (const tpl of rawTemplate) {
-    const slot = Math.min(4, Math.max(1, Number(tpl.number ?? tpl.slot ?? 1)));
+    const slot = Math.min(cl, Math.max(1, Number(tpl.number ?? tpl.slot ?? 1)));
     if (!bySlot.has(slot)) bySlot.set(slot, { ...tpl, number: slot });
   }
-  const templateSource = [1, 2, 3, 4].map((s) => bySlot.get(s)).filter(Boolean) as any[];
+  const templateSource = Array.from({ length: cl }, (_, i) => {
+    const slot = i + 1;
+    const w = bySlot.get(slot);
+    if (w) return w;
+    const fb = bySlot.get(1) ?? rawTemplate[0];
+    if (!fb) return { id: `empty-${slot}`, number: slot, days: [] };
+    return { ...fb, number: slot, id: fb.id ?? `template-w${slot}` };
+  }) as any[];
   if (templateSource.length === 0) return;
 
   const effectiveVersions = input.versions?.length
@@ -309,7 +331,7 @@ export async function disassemblePlanToCollections(input: DisassemblePlanInput) 
     });
 
     for (const tplWeek of templateSource) {
-      const slot = Math.min(4, Math.max(1, Number(tplWeek.number ?? tplWeek.slot ?? 1)));
+      const slot = Math.min(cl, Math.max(1, Number(tplWeek.number ?? tplWeek.slot ?? 1)));
       const tw = await TemplateWeek.create({
         programVersionId: pv._id,
         slot,
@@ -349,9 +371,10 @@ export async function disassemblePlanToCollections(input: DisassemblePlanInput) 
   }
 }
 
-/** Tipo de semana 1–4 dentro del mesociclo (para derivar plantilla desde 52 semanas). */
-function getWeekType(weekNumber: number): number {
-  return ((Math.max(1, weekNumber) - 1) % 4) + 1;
+/** Tipo de semana 1–N dentro del ciclo (misma lógica que getMesocycleWeekIndex en el cliente). */
+function getWeekType(weekNumber: number, cycleLength: number): number {
+  const cl = Math.max(1, Math.min(52, cycleLength));
+  return ((Math.max(1, weekNumber) - 1) % cl) + 1;
 }
 
 function resolveTemplateSource(input: DisassemblePlanInput): any[] {
@@ -363,15 +386,27 @@ function resolveTemplateSource(input: DisassemblePlanInput): any[] {
       (a.effectiveFromWeek ?? 0) >= (b.effectiveFromWeek ?? 0) ? a : b
     );
     const weeks: any[] = latest.weeks || [];
-    if (weeks.length >= 4) {
+    let clGuess: number;
+    if (Number.isFinite(input.cycleLength) && input.cycleLength! >= 1) {
+      clGuess = Math.max(1, Math.min(52, input.cycleLength!));
+    } else if (weeks.length >= 52) {
+      clGuess = 4;
+    } else {
+      clGuess = Math.max(1, Math.min(52, weeks.length || 4));
+    }
+    if (weeks.length >= clGuess) {
       const byType: Record<number, any> = {};
       weeks.forEach((w: any) => {
-        const type = getWeekType(Number(w.number) || 1);
+        const type = getWeekType(Number(w.number) || 1, clGuess);
         if (!byType[type]) byType[type] = w;
       });
-      return [1, 2, 3, 4].map((t) => byType[t] || weeks[0]).map((w, i) => ({ ...w, number: i + 1 }));
+      return Array.from({ length: clGuess }, (_, i) => {
+        const t = i + 1;
+        const w = byType[t] || weeks[0];
+        return { ...w, number: t };
+      });
     }
-    return weeks.slice(0, 4).map((w: any, i: number) => ({ ...w, number: i + 1 }));
+    return weeks.slice(0, clGuess).map((w: any, i: number) => ({ ...w, number: i + 1 }));
   }
   return [];
 }

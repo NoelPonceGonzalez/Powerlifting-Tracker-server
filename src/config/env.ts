@@ -9,6 +9,7 @@ const truthy = (v: string | undefined) => {
 
 const nodeEnv = process.env.NODE_ENV || 'development';
 
+
 /** En producción (p. ej. AWS) no asumir localhost: usa APP_URL o CORS_ORIGINS. */
 const defaultAppUrl =
   process.env.APP_URL?.trim() ||

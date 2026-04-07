@@ -28,6 +28,12 @@ const router = express.Router();
 const oid = (v: any) =>
   v instanceof mongoose.Types.ObjectId ? v : new mongoose.Types.ObjectId(String(v));
 
+/** Mensual (misma plantilla por semanas del mes) salvo `false` explícito = ciclo por N semanas. */
+function parseSameTemplateAllWeeks(v: unknown): boolean {
+  if (v === false || v === 'false' || v === 0) return false;
+  return true;
+}
+
 // GET /api/routines
 router.get('/', authenticateToken, async (req: Request, res: Response) => {
   try {
@@ -62,9 +68,12 @@ router.post(
         userId,
         name,
         isActive,
-        sameTemplateAllWeeks: req.body.sameTemplateAllWeeks !== false,
+        sameTemplateAllWeeks: parseSameTemplateAllWeeks(req.body.sameTemplateAllWeeks),
         hiddenFromSocial: !!req.body.hiddenFromSocial,
         cycleLength: Number.isFinite(req.body.cycleLength) ? Math.max(1, Math.min(52, req.body.cycleLength)) : 4,
+        skippedWeeks: Array.isArray(req.body.skippedWeeks)
+          ? req.body.skippedWeeks.filter((w: unknown) => typeof w === 'number' && Number.isFinite(w))
+          : [],
       });
 
       const rid = oid(routine._id);
@@ -73,6 +82,7 @@ router.post(
         baseTemplate,
         weekTypeOverrides,
         versions: versions || (Array.isArray(weeks) && weeks.length > 0 ? [{ effectiveFromWeek: 1, weeks }] : undefined),
+        cycleLength: Number.isFinite(req.body.cycleLength) ? Math.max(1, Math.min(52, req.body.cycleLength)) : undefined,
       });
       await pruneWorkoutDataAfterPlanChange(rid);
 
@@ -94,7 +104,9 @@ router.patch('/:id/plan', authenticateToken, async (req: Request, res: Response)
 
     const { baseTemplate, weekTypeOverrides, versions, sameTemplateAllWeeks, hiddenFromSocial } = req.body;
 
-    if (sameTemplateAllWeeks !== undefined) routine.sameTemplateAllWeeks = !!sameTemplateAllWeeks;
+    if (sameTemplateAllWeeks !== undefined) {
+      routine.sameTemplateAllWeeks = parseSameTemplateAllWeeks(sameTemplateAllWeeks);
+    }
     if (hiddenFromSocial !== undefined) routine.hiddenFromSocial = !!hiddenFromSocial;
     if (req.body.cycleLength !== undefined && Number.isFinite(req.body.cycleLength)) {
       (routine as any).cycleLength = Math.max(1, Math.min(52, req.body.cycleLength));
@@ -110,7 +122,15 @@ router.patch('/:id/plan', authenticateToken, async (req: Request, res: Response)
       (Array.isArray(versions) && versions.length > 0);
 
     if (hasTemplateData) {
-      await disassemblePlanToCollections({ routineId: rid, baseTemplate, weekTypeOverrides, versions });
+      await disassemblePlanToCollections({
+        routineId: rid,
+        baseTemplate,
+        weekTypeOverrides,
+        versions,
+        cycleLength: Number.isFinite((routine as any).cycleLength)
+          ? Math.max(1, Math.min(52, (routine as any).cycleLength))
+          : undefined,
+      });
       await pruneWorkoutDataAfterPlanChange(rid);
     }
 
@@ -412,7 +432,9 @@ router.put(
       if (!routine) return res.status(404).json({ error: 'Rutina no encontrada' });
 
       if (name !== undefined) routine.name = name;
-      if (sameTemplateAllWeeks !== undefined) routine.sameTemplateAllWeeks = !!sameTemplateAllWeeks;
+      if (sameTemplateAllWeeks !== undefined) {
+        routine.sameTemplateAllWeeks = parseSameTemplateAllWeeks(sameTemplateAllWeeks);
+      }
       if (hiddenFromSocial !== undefined) routine.hiddenFromSocial = !!hiddenFromSocial;
       if (req.body.cycleLength !== undefined && Number.isFinite(req.body.cycleLength)) {
         (routine as any).cycleLength = Math.max(1, Math.min(52, req.body.cycleLength));
@@ -463,6 +485,9 @@ router.put(
           baseTemplate,
           weekTypeOverrides,
           versions: versions || (Array.isArray(weeks) && weeks.length > 0 ? [{ effectiveFromWeek: 1, weeks }] : undefined),
+          cycleLength: Number.isFinite((routine as any).cycleLength)
+            ? Math.max(1, Math.min(52, (routine as any).cycleLength))
+            : undefined,
         });
         await pruneWorkoutDataAfterPlanChange(rid);
       }

@@ -33,30 +33,39 @@ export function collectValidExpoTokens(user: {
   return [...new Set(valid)];
 }
 
+/**
+ * Metadatos para deep link al pulsar la notificación (WebView + nativo).
+ * - `screen`: dashboard = Progreso; program = Rutina/plan; social = Comunidad (usa `tab`).
+ * Tipos sin pantalla concreta → solo abrir la app en Progreso.
+ */
 function buildPushDataPayload(data?: Record<string, any>): Record<string, string> {
   const type = String(data?.type ?? '');
+
+  let screen: 'dashboard' | 'program' | 'social' = 'dashboard';
   let tab: 'friends' | 'challenges' | 'checkins' = 'checkins';
-  if (type === 'friend_request' || type === 'friend_accepted') {
+
+  if (type === 'new_rm') {
+    screen = 'dashboard';
+  } else if (type === 'friend_request' || type === 'friend_accepted') {
+    screen = 'social';
     tab = 'friends';
   } else if (type === 'challenge_invite' || type === 'challenge_join' || type === 'challenge_winner') {
+    screen = 'social';
     tab = 'challenges';
-  } else if (type === 'new_rm') {
-    tab = 'friends';
-  } else if (
-    type === 'gym_checkin' ||
-    type === 'same_time_confirmation' ||
-    type === ''
-  ) {
+  } else if (type === 'gym_checkin' || type === 'same_time_confirmation') {
+    screen = 'social';
     tab = 'checkins';
+  } else if (type === '') {
+    screen = 'dashboard';
+  } else {
+    screen = 'dashboard';
   }
 
   const merged: Record<string, unknown> = {
-    screen: 'social',
-    tab,
     ...(data || {}),
+    screen,
+    tab,
   };
-  merged.screen = 'social';
-  merged.tab = tab;
 
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(merged)) {

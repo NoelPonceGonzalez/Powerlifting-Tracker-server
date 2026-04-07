@@ -17,6 +17,12 @@ function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+/** Misma regla que al crear rutina: mensual salvo `false` explícito (ciclo por semanas). */
+function parseSameTemplateAllWeeks(v: unknown): boolean {
+  if (v === false || v === 'false' || v === 0) return false;
+  return true;
+}
+
 /** Cuenta creada solo tras completar registro: contraseña, nombre y género en MongoDB. */
 const REGISTERED_USER_MATCH = {
   password: { $exists: true, $nin: [null, ''] },
@@ -201,12 +207,20 @@ router.get('/friends/:friendId/routine', authenticateToken, async (req: Request,
     }
 
     const friendObjectId = new mongoose.Types.ObjectId(String(friendId));
-    const routine = await Routine.findOne({ userId: friendObjectId, isActive: true });
-    if (!routine || (routine as any).hiddenFromSocial) {
+    const routine = await Routine.findOne({ userId: friendObjectId, isActive: true }).lean();
+    if (!routine || (routine as { hiddenFromSocial?: boolean }).hiddenFromSocial) {
       return res.json(null);
     }
 
     const assembled = (await assembleFullRoutine(routine)) as Record<string, unknown>;
+    const stawRaw = (routine as { sameTemplateAllWeeks?: unknown }).sameTemplateAllWeeks;
+    const stawAssembled = (assembled as { sameTemplateAllWeeks?: unknown }).sameTemplateAllWeeks;
+    const sameTemplateAllWeeks = parseSameTemplateAllWeeks(
+      stawRaw !== undefined && stawRaw !== null ? stawRaw : stawAssembled
+    );
+
+    const wto = (assembled as { weekTypeOverrides?: unknown[] }).weekTypeOverrides;
+    const weekTypeOverrides = Array.isArray(wto) ? wto : [];
 
     res.json({
       id: String(assembled._id ?? assembled.id ?? ''),
@@ -215,6 +229,12 @@ router.get('/friends/:friendId/routine', authenticateToken, async (req: Request,
       baseTemplate: assembled.baseTemplate,
       versions: assembled.versions,
       logs: assembled.logs,
+      weekTypeOverrides,
+      sameTemplateAllWeeks,
+      cycleLength: (routine as { cycleLength?: number }).cycleLength ?? 4,
+      skippedWeeks: Array.isArray((routine as { skippedWeeks?: number[] }).skippedWeeks)
+        ? (routine as { skippedWeeks: number[] }).skippedWeeks
+        : [],
     });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
