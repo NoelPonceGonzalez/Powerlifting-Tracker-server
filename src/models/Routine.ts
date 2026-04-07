@@ -12,6 +12,7 @@ export interface IRoutine extends Document {
   sameTemplateAllWeeks?: boolean;
   hiddenFromSocial?: boolean;
   cycleLength?: number;
+  /** Lineal: semanas civiles 1–53. Por bloque (sameTemplateAllWeeks false): posición en el mesociclo 1…cycleLength. */
   skippedWeeks?: number[];
   /** ISO: desde aquí los % de progreso en gráficos usan este punto como referencia (no modifica TM). */
   progressCheckpointAt?: Date;
