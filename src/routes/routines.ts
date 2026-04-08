@@ -74,6 +74,9 @@ router.post(
         skippedWeeks: Array.isArray(req.body.skippedWeeks)
           ? req.body.skippedWeeks.filter((w: unknown) => typeof w === 'number' && Number.isFinite(w))
           : [],
+        shiftedAtCalendarWeeks: Array.isArray(req.body.shiftedAtCalendarWeeks)
+          ? req.body.shiftedAtCalendarWeeks.filter((w: unknown) => typeof w === 'number' && Number.isFinite(w))
+          : [],
       });
 
       const rid = oid(routine._id);
@@ -113,6 +116,9 @@ router.patch('/:id/plan', authenticateToken, async (req: Request, res: Response)
     }
     if (Array.isArray(req.body.skippedWeeks)) {
       (routine as any).skippedWeeks = req.body.skippedWeeks.filter((w: any) => Number.isFinite(w));
+    }
+    if (Array.isArray(req.body.shiftedAtCalendarWeeks)) {
+      (routine as any).shiftedAtCalendarWeeks = req.body.shiftedAtCalendarWeeks.filter((w: any) => Number.isFinite(w));
     }
     await routine.save();
 
@@ -441,6 +447,9 @@ router.put(
       }
       if (Array.isArray(req.body.skippedWeeks)) {
         (routine as any).skippedWeeks = req.body.skippedWeeks.filter((w: any) => Number.isFinite(w));
+      }
+      if (Array.isArray(req.body.shiftedAtCalendarWeeks)) {
+        (routine as any).shiftedAtCalendarWeeks = req.body.shiftedAtCalendarWeeks.filter((w: any) => Number.isFinite(w));
       }
       if (req.body.progressCheckpointAt !== undefined) {
         const raw = req.body.progressCheckpointAt;

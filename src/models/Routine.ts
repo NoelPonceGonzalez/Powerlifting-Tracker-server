@@ -14,6 +14,8 @@ export interface IRoutine extends Document {
   cycleLength?: number;
   /** Lineal: semanas civiles 1–53. Por bloque (sameTemplateAllWeeks false): posición en el mesociclo 1…cycleLength. */
   skippedWeeks?: number[];
+  /** Semanas civiles donde «Saltar la semana» desplazó el ciclo (solo block mode). */
+  shiftedAtCalendarWeeks?: number[];
   /** ISO: desde aquí los % de progreso en gráficos usan este punto como referencia (no modifica TM). */
   progressCheckpointAt?: Date;
   /** Snapshot de TM al momento del checkpoint ({ tmId: valor }). El baseline de % se toma de aquí. */
@@ -55,6 +57,10 @@ const RoutineSchema = new Schema<IRoutine>(
       max: 52,
     },
     skippedWeeks: {
+      type: [Number],
+      default: [],
+    },
+    shiftedAtCalendarWeeks: {
       type: [Number],
       default: [],
     },
