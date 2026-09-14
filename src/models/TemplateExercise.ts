@@ -14,6 +14,10 @@ export interface ITemplateExercise extends Document {
   linkedTrainingMaxId?: mongoose.Types.ObjectId;
   /** IDs de cliente (p. ej. tm-1) cuando aún no hay ObjectId de TM */
   linkedClientKey?: string;
+  /** RPE objetivo prescrito ("6", "8,5"); viene de planes importados del entrenador. */
+  targetRpe?: string;
+  /** Indicación del entrenador para ese ejercicio ("grabar ambas piernas"). */
+  coachNote?: string;
 }
 
 const TemplateExerciseSchema = new Schema<ITemplateExercise>(
@@ -30,6 +34,8 @@ const TemplateExerciseSchema = new Schema<ITemplateExercise>(
     mode: { type: String, enum: ['weight', 'reps', 'seconds'], default: 'weight' },
     linkedTrainingMaxId: { type: Schema.Types.ObjectId, ref: 'TrainingMax' },
     linkedClientKey: { type: String, trim: true, maxlength: 128 },
+    targetRpe: { type: String, trim: true, maxlength: 8 },
+    coachNote: { type: String, trim: true, maxlength: 300 },
   },
   { timestamps: false }
 );

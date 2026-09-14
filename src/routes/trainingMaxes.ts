@@ -3,6 +3,7 @@ import mongoose from 'mongoose';
 import { authenticateToken } from '../middleware/auth';
 import { TrainingMax } from '../models/TrainingMax';
 import { Routine } from '../models/Routine';
+import { User } from '../models/User';
 import { HistoryEntry } from '../models/HistoryEntry';
 import { body, query, validationResult } from 'express-validator';
 import { calendarMonth1FromDateISO, dateISOFromYearWeekDay } from '../utils/calendarWeekDate';
@@ -45,6 +46,16 @@ async function assertRoutineOwned(userId: mongoose.Types.ObjectId, routineId: st
   return routine;
 }
 
+/** Dueño o su entrenador: el alumno solo tiene un coach; el coach puede tener muchos alumnos. */
+async function assertRoutineOwnedOrCoach(editorId: mongoose.Types.ObjectId, routineId: string) {
+  const owned = await Routine.findOne({ _id: routineId, userId: editorId });
+  if (owned) return owned;
+  const any = await Routine.findById(routineId);
+  if (!any) return null;
+  const linked = await User.findOne({ _id: any.userId, coachId: editorId }).select('_id').lean();
+  return linked ? any : null;
+}
+
 /** Entradas de historial sin rutina → rutina activa (migración). */
 async function migrateLegacyHistoryEntries(userId: mongoose.Types.ObjectId) {
   const orphanCount = await HistoryEntry.countDocuments({
@@ -76,13 +87,14 @@ router.get(
       await migrateLegacyTrainingMaxes(userId);
 
       const routineId = String(req.query.routineId);
-      const routine = await assertRoutineOwned(userId, routineId);
+      const routine = await assertRoutineOwnedOrCoach(userId, routineId);
       if (!routine) {
         return res.status(404).json({ error: 'Rutina no encontrada' });
       }
 
       const rid = routine._id instanceof mongoose.Types.ObjectId ? routine._id : new mongoose.Types.ObjectId(String(routine._id));
-      const trainingMaxes = await TrainingMax.find({ userId, routineId: rid }).sort({ createdAt: 1 });
+      const ownerId = routine.userId instanceof mongoose.Types.ObjectId ? routine.userId : new mongoose.Types.ObjectId(String(routine.userId));
+      const trainingMaxes = await TrainingMax.find({ userId: ownerId, routineId: rid }).sort({ createdAt: 1 });
       res.json(trainingMaxes);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -110,13 +122,14 @@ router.post(
       const userId = new mongoose.Types.ObjectId((req as any).user.userId);
       const { name, value, mode, linkedExercise, sharedToSocial, routineId } = req.body;
 
-      const routine = await assertRoutineOwned(userId, routineId);
+      const routine = await assertRoutineOwnedOrCoach(userId, routineId);
       if (!routine) {
         return res.status(404).json({ error: 'Rutina no encontrada' });
       }
 
+      const ownerId = routine.userId instanceof mongoose.Types.ObjectId ? routine.userId : new mongoose.Types.ObjectId(String(routine.userId));
       const trainingMax = new TrainingMax({
-        userId,
+        userId: ownerId,
         routineId: routine._id,
         name,
         value,
@@ -133,7 +146,7 @@ router.post(
         );
       }
       const out = await TrainingMax.findById(trainingMax._id);
-      broadcastSse([userId.toString()], 'routine_update');
+      broadcastSse([userId.toString(), String(ownerId)], 'routine_update');
       res.status(201).json(out ?? trainingMax);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -160,7 +173,7 @@ router.put(
       const userId = new mongoose.Types.ObjectId((req as any).user.userId);
       const { name, value, mode, linkedExercise, sharedToSocial, routineId } = req.body;
 
-      const routine = await assertRoutineOwned(userId, routineId);
+      const routine = await assertRoutineOwnedOrCoach(userId, routineId);
       if (!routine) {
         return res.status(404).json({ error: 'Rutina no encontrada' });
       }
@@ -168,8 +181,12 @@ router.put(
         routine._id instanceof mongoose.Types.ObjectId
           ? routine._id
           : new mongoose.Types.ObjectId(String(routine._id));
+      const ownerId =
+        routine.userId instanceof mongoose.Types.ObjectId
+          ? routine.userId
+          : new mongoose.Types.ObjectId(String(routine.userId));
 
-      const trainingMax = await TrainingMax.findOne({ _id: req.params.id, userId, routineId: rid });
+      const trainingMax = await TrainingMax.findOne({ _id: req.params.id, userId: ownerId, routineId: rid });
       if (!trainingMax) {
         return res.status(404).json({ error: 'Training Max no encontrado en esta rutina' });
       }
@@ -188,17 +205,18 @@ router.put(
       $set.updatedAt = updatedAtClient ?? new Date();
 
       const updated = await TrainingMax.findOneAndUpdate(
-        { _id: req.params.id, userId, routineId: rid },
+        { _id: req.params.id, userId: ownerId, routineId: rid },
         { $set },
         { new: true, runValidators: true, timestamps: false }
       );
       if (!updated) {
         return res.status(404).json({ error: 'Training Max no encontrado en esta rutina' });
       }
-      broadcastSse([userId.toString()], 'routine_update');
+      broadcastSse([userId.toString(), String(ownerId)], 'routine_update');
 
       const newValue = typeof value === 'number' ? value : typeof value === 'string' ? parseFloat(value) : NaN;
-      if (Number.isFinite(newValue) && newValue > prevValue) {
+      // Solo se avisa de los ejercicios que el usuario comparte: el resto son privados.
+      if (Number.isFinite(newValue) && newValue > prevValue && updated.sharedToSocial) {
         (async () => {
           try {
             const friendships = await Friendship.find({
@@ -227,6 +245,8 @@ router.put(
               relatedData: { exerciseName: exName, newValue, prevValue, mode: updated.mode },
             }));
             await Notification.insertMany(notifications);
+            // Sin esto la campana del amigo no se entera hasta que recargue.
+            broadcastSse(friendIds, 'social_update');
             await sendPushToUsers(friendIds, notifTitle, notifMessage, { type: 'new_rm', exerciseName: exName });
           } catch (e) {
             console.error('[PUSH] Error new_rm notification:', e);
@@ -255,7 +275,7 @@ router.delete(
 
       const userId = new mongoose.Types.ObjectId((req as any).user.userId);
       const routineId = String(req.query.routineId);
-      const routine = await assertRoutineOwned(userId, routineId);
+      const routine = await assertRoutineOwnedOrCoach(userId, routineId);
       if (!routine) {
         return res.status(404).json({ error: 'Rutina no encontrada' });
       }
@@ -263,13 +283,17 @@ router.delete(
         routine._id instanceof mongoose.Types.ObjectId
           ? routine._id
           : new mongoose.Types.ObjectId(String(routine._id));
+      const ownerId =
+        routine.userId instanceof mongoose.Types.ObjectId
+          ? routine.userId
+          : new mongoose.Types.ObjectId(String(routine.userId));
 
-      const trainingMax = await TrainingMax.findOneAndDelete({ _id: req.params.id, userId, routineId: rid });
+      const trainingMax = await TrainingMax.findOneAndDelete({ _id: req.params.id, userId: ownerId, routineId: rid });
       if (!trainingMax) {
         return res.status(404).json({ error: 'Training Max no encontrado en esta rutina' });
       }
       await HistoryTmSnapshot.deleteMany({ trainingMaxId: trainingMax._id });
-      broadcastSse([userId.toString()], 'routine_update');
+      broadcastSse([userId.toString(), String(ownerId)], 'routine_update');
       res.json({ message: 'Training Max eliminado' });
     } catch (error: any) {
       res.status(500).json({ error: error.message });

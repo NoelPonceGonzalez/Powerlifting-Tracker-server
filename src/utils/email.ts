@@ -57,9 +57,20 @@ Tu código de verificación para completar el registro: ${verificationToken}
 Introduce este código en la app. Caduca en 24 horas. No lo compartas con nadie.`,
   };
 
+  // Sin credenciales SMTP no se puede enviar. En desarrollo se saca el código por
+  // consola para poder registrarse igual; en producción es un error de verdad.
+  if (!config.email.enabled) {
+    if (config.nodeEnv === 'production') {
+      throw new Error('El envío de correo no está configurado (EMAIL_USER / EMAIL_PASS).');
+    }
+    console.log(`\n📧 [DEV] Sin SMTP configurado. Código de verificación para ${email}: ${verificationToken}\n`);
+    return;
+  }
+
   try {
     await transporter.sendMail(mailOptions);
   } catch (error) {
-    throw new Error('Hubo un error al intentar enviar el correo de verificación.'); 
+    console.error('[EMAIL] Fallo enviando la verificación:', error);
+    throw new Error('Hubo un error al intentar enviar el correo de verificación.');
   }
 };

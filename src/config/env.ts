@@ -1,5 +1,16 @@
 import dotenv from 'dotenv';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
+/**
+ * Este módulo se evalúa al importarlo, antes de que quien arranca pueda llamar a
+ * dotenv. Si solo leyera el .env del directorio actual, arrancar desde client/
+ * (npm start) ignoraría por completo server/.env. Por eso se carga aquí, por ruta.
+ */
+const currentDir = path.dirname(fileURLToPath(import.meta.url));
+// src/config/env.ts y dist/config/env.js: en ambos casos server/.env está dos niveles arriba.
+dotenv.config({ path: path.resolve(currentDir, '..', '..', '.env') });
+// El .env del directorio de arranque puede añadir cosas, pero no pisa lo anterior.
 dotenv.config();
 
 const truthy = (v: string | undefined) => {
@@ -15,19 +26,44 @@ const defaultAppUrl =
   process.env.APP_URL?.trim() ||
   (nodeEnv === 'production' ? '' : 'http://localhost:3000');
 
+const isProduction = nodeEnv === 'production';
+
+/**
+ * Ninguna credencial vive en el código: todas salen de server/.env (ver .env.example).
+ * En producción se corta el arranque si falta alguna crítica; en desarrollo se avisa
+ * y se sigue, para poder trastear sin configurarlo todo.
+ */
+function requiredSecret(name: string, devFallback: string): string {
+  const value = process.env[name]?.trim();
+  if (value) return value;
+  if (isProduction) {
+    throw new Error(
+      `Falta la variable de entorno ${name}. Defínela en el servidor antes de arrancar en producción.`
+    );
+  }
+  console.warn(`⚠️  ${name} no está definida: se usa un valor solo para desarrollo local.`);
+  return devFallback;
+}
+
+const emailUser = process.env.EMAIL_USER?.trim() || '';
+const emailPass = process.env.EMAIL_PASS?.trim() || '';
+
 export const config = {
   port: parseInt(process.env.PORT || '3000', 10),
   nodeEnv,
-  jwtSecret: process.env.JWT_SECRET || 'powerlifting-super-secret-jwt-key-2026',
-  mongodbUri: process.env.MONGODB_URI || 'mongodb+srv://root:OM5efz85AL4SB4Ad@power.ax8gn87.mongodb.net/?appName=Power',
+  // Cambiar este valor invalida todas las sesiones abiertas: los usuarios tendrán que volver a entrar.
+  jwtSecret: requiredSecret('JWT_SECRET', 'dev-only-jwt-secret-no-usar-en-produccion'),
+  mongodbUri: process.env.MONGODB_URI?.trim() || 'mongodb://127.0.0.1:27017/powerlifting',
   /** Si true, al arrancar se borran colecciones en la BD que no correspondan a ningún modelo de la app. */
   mongodbDropUnusedCollections: truthy(process.env.MONGODB_DROP_UNUSED_COLLECTIONS),
   email: {
     host: process.env.EMAIL_HOST || 'smtp.gmail.com',
     port: parseInt(process.env.EMAIL_PORT || '587'),
-    user: process.env.EMAIL_USER || 'noel.ponce.gonzalez@gmail.com',
-    pass: process.env.EMAIL_PASS || 'osam pwxk watx ensq',
+    user: emailUser,
+    pass: emailPass,
     from: process.env.EMAIL_FROM || 'noreply@powerliftingtracker.com',
+    /** Sin credenciales no se intenta enviar nada: el código de verificación se muestra por consola. */
+    enabled: Boolean(emailUser && emailPass),
   },
   appUrl: defaultAppUrl,
   mobileAppScheme: process.env.MOBILE_APP_SCHEME || 'powerliftingtracker',
@@ -53,6 +89,10 @@ export function getCorsAllowedOrigins(): string[] {
       'http://localhost:3001',
       'http://127.0.0.1:3001',
       'http://10.0.2.2:3001',
+      'http://localhost:5173',
+      'http://127.0.0.1:5173',
+      'http://localhost:4173',
+      'http://127.0.0.1:4173',
     );
   }
   return [...new Set(list)];

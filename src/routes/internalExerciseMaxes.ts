@@ -88,6 +88,7 @@ router.get(
 
 /**
  * Sube o crea: actualiza solo el campo del modo indicado con max(previo, candidateValue).
+ * Con `overwrite` se fija el valor tal cual (el usuario lo escribe a mano en el plan).
  * Por rutina: `routineId` obligatorio.
  */
 router.post(
@@ -98,6 +99,7 @@ router.post(
     body('name').trim().notEmpty().withMessage('name requerido'),
     body('mode').isIn(['weight', 'reps', 'seconds']).withMessage('mode inválido'),
     body('candidateValue').isNumeric().withMessage('candidateValue numérico'),
+    body('overwrite').optional().isBoolean().withMessage('overwrite booleano'),
   ],
   async (req: Request, res: Response) => {
     try {
@@ -111,6 +113,7 @@ router.post(
       const name = String(req.body.name).trim();
       const mode = String(req.body.mode) as InternalMode;
       const candidateValue = Number(req.body.candidateValue);
+      const overwrite = req.body.overwrite === true || req.body.overwrite === 'true';
       const nameNormalized = normalizeName(name);
 
       const routine = await assertRoutineOwned(userId, routineId);
@@ -132,7 +135,7 @@ router.post(
           field === 'valueWeight'
             ? ex.valueWeight ?? ex.value ?? 0
             : ex[field] ?? 0;
-        if (candidateValue > prev) {
+        if (overwrite || candidateValue > prev) {
           ex[field] = candidateValue;
         }
         await existing.save();

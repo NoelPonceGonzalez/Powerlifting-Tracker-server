@@ -53,6 +53,9 @@ export async function migrateRoutineEmbeddedLogsToExerciseLogs(): Promise<void> 
             weight: s?.weight != null && s.weight !== '' ? s.weight : null,
             completed: !!s?.completed,
             ...(s?.inputMode === 'kg' || s?.inputMode === 'pct' ? { inputMode: s.inputMode } : {}),
+            ...(typeof s?.mediaKey === 'string' && s.mediaKey
+              ? { mediaKey: s.mediaKey, mediaType: s.mediaType === 'image' ? 'image' : 'video' }
+              : {}),
           }))
         : [];
       ops.push({

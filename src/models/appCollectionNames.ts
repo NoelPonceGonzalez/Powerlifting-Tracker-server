@@ -3,8 +3,15 @@
  * Si añades un modelo nuevo, impórtalo aquí para que no se borre como "no usada".
  */
 import { Challenge } from './Challenge';
+import { ChatGroup } from './ChatGroup';
+import { ChatGroupInvite } from './ChatGroupInvite';
+import { ChatMessage } from './ChatMessage';
+import { ChatRequest } from './ChatRequest';
+import { CoachRequest } from './CoachRequest';
 import { ExerciseLog } from './ExerciseLog';
 import { Friendship } from './Friendship';
+import { Post } from './Post';
+import { PostComment } from './PostComment';
 import { GymCheckIn } from './GymCheckIn';
 import { HistoryEntry } from './HistoryEntry';
 import { HistoryTmSnapshot } from './HistoryTmSnapshot';
@@ -42,6 +49,13 @@ const REGISTERED_MODELS = [
   GymCheckIn,
   Friendship,
   Challenge,
+  CoachRequest,
+  Post,
+  PostComment,
+  ChatMessage,
+  ChatGroup,
+  ChatGroupInvite,
+  ChatRequest,
 ] as const;
 
 export function getAppMongoCollectionNames(): Set<string> {

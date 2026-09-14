@@ -57,7 +57,13 @@ export type SseEventType =
   | 'social_update'    // friends, requests changed
   | 'checkin_update'   // gym check-ins changed
   | 'challenge_update' // tournaments changed
-  | 'routine_update';  // TMs, routine data changed
+  | 'routine_update'   // TMs, routine data changed
+  | 'chat_message'
+  | 'chat_typing';
+
+export function isUserOnline(userId: string): boolean {
+  return (clients.get(String(userId))?.length ?? 0) > 0;
+}
 
 /**
  * Broadcast an SSE event to specific users.

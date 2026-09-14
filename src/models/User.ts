@@ -8,6 +8,10 @@ export interface IUser extends Document {
   gender?: 'hombre' | 'mujer';
   avatar?: string;
   bodyWeight?: number;
+  /** Texto libre del perfil público. */
+  bio?: string;
+  /** Amigo marcado como entrenador: se muestra en su perfil y en el de sus alumnos. */
+  coachId?: mongoose.Types.ObjectId | null;
   theme?: 'light' | 'dark';
   /** Acento rosa (MB) en toda la UI; independiente de claro/oscuro. */
   mbMode?: boolean;
@@ -62,6 +66,16 @@ const UserSchema = new Schema<IUser>(
     },
     bodyWeight: {
       type: Number,
+    },
+    bio: {
+      type: String,
+      trim: true,
+      maxlength: 300,
+    },
+    coachId: {
+      type: Schema.Types.ObjectId,
+      ref: 'User',
+      default: null,
     },
     theme: {
       type: String,

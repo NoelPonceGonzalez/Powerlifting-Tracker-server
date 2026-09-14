@@ -1,8 +1,16 @@
 /**
- * Puntuación de torneos:
- * - Peso (kg): puntos IPF GL (Goodlift) según ejercicio y género (bodyWeightScoring no aplica).
- * - Repeticiones / segundos: según bodyWeightScoring (más peso → más puntos, menos peso → más puntos, o sin ponderar).
- * Modo "solo marca": el ranking usa el valor bruto (kg, reps o s).
+ * Puntuación de torneos, justa entre pesos y géneros.
+ *
+ * Fuerza (kg): IPF GL oficial (mayo 2020, vigente 2025).
+ *   GL = resultado × 100 / (A − B·e^(−C·peso))
+ *   Banca clásica → coeficientes Classic Bench Press.
+ *   Sentadilla, peso muerto y el resto → Classic Powerlifting
+ *   (la IPF no publica GL de sentadilla/muerto sueltos; usar equipped
+ *   o coeficientes inventados sesga a hombres o a gente con equipación).
+ *
+ * Reps / tiempo: peso corporal (alometría) + ratio de rendimiento
+ *   publicado por género (NSCA / Nuzzo 2023). No un +25 % plano:
+ *   el tronco (plancha) está casi a la par; el tren superior no.
  */
 
 export type ChallengeScoreType = 'max_reps' | 'weight' | 'seconds';
@@ -17,35 +25,33 @@ export function normalizeBodyWeightScoring(raw: unknown): BodyWeightScoringMode 
 
 type IpfGlCoefficients = { a: number; b: number; c: number };
 
-const IPF_GL_COEFFICIENTS: Record<Gender, Record<'powerlifting' | 'squat' | 'bench' | 'deadlift', IpfGlCoefficients>> = {
+/** Coeficientes oficiales IPF GL 2020 (classic / raw). */
+const IPF_GL_CLASSIC: Record<Gender, { total: IpfGlCoefficients; bench: IpfGlCoefficients }> = {
   hombre: {
-    powerlifting: { a: 1199.72839, b: 1025.18162, c: 0.00921 },
-    squat: { a: 1236.25115, b: 1449.21864, c: 0.01644 },
-    bench: { a: 381.22073, b: 733.79378, c: 0.02398 },
-    deadlift: { a: 674.585, b: 1149.692, c: 0.015 },
+    total: { a: 1199.72839, b: 1025.18162, c: 0.00921 },
+    bench: { a: 320.98041, b: 281.40258, c: 0.01008 },
   },
   mujer: {
-    powerlifting: { a: 610.32796, b: 1045.59282, c: 0.03048 },
-    squat: { a: 758.63878, b: 949.31382, c: 0.02435 },
-    bench: { a: 221.82209, b: 357.00377, c: 0.02937 },
-    deadlift: { a: 482.50024, b: 819.10084, c: 0.02963 },
+    total: { a: 610.32796, b: 1045.59282, c: 0.03048 },
+    bench: { a: 142.40398, b: 442.52671, c: 0.04724 },
   },
 };
 
 function getIpfGlCoefficients(exercise: string, gender: Gender): IpfGlCoefficients {
   const normalized = exercise.toLowerCase();
-  if (/(bench|press banca|banca)/i.test(normalized)) return IPF_GL_COEFFICIENTS[gender].bench;
-  if (/(squat|sentadilla)/i.test(normalized)) return IPF_GL_COEFFICIENTS[gender].squat;
-  if (/(deadlift|peso muerto)/i.test(normalized)) return IPF_GL_COEFFICIENTS[gender].deadlift;
-  return IPF_GL_COEFFICIENTS[gender].powerlifting;
+  if (/(bench|press banca|banca|press de banca)/i.test(normalized)) {
+    return IPF_GL_CLASSIC[gender].bench;
+  }
+  return IPF_GL_CLASSIC[gender].total;
 }
 
 function computeIpfGlPoints(value: number, bodyWeight: number, exercise: string, gender: Gender): number {
-  const safeBodyWeight = bodyWeight > 0 ? bodyWeight : 70;
+  const bw = bodyWeight > 0 ? bodyWeight : gender === 'mujer' ? 60 : 80;
   const coeffs = getIpfGlCoefficients(exercise, gender);
-  const denominator = coeffs.a - coeffs.b * Math.exp(-coeffs.c * safeBodyWeight);
+  const denominator = coeffs.a - coeffs.b * Math.exp(-coeffs.c * bw);
   if (denominator <= 0) return 0;
-  const points = (100 / denominator) * value;
+  const coefficient = Math.round((100 / denominator) * 1e6) / 1e6;
+  const points = coefficient * value;
   return Math.round(points * 100) / 100;
 }
 
@@ -54,9 +60,21 @@ export function isPullUpLikeExercise(exercise: string): boolean {
   return /(dominad|pull[\s-]?up|chin|muscle|tracci[oó]n|barra fija)/i.test(exercise);
 }
 
-/** Solo reps y segundos: +25 % al score para género mujer (no aplica a torneos por peso IPF GL). */
-function genderFactor(gender?: Gender): number {
-  return gender === 'mujer' ? 1.25 : 1;
+function isLowerBodyExercise(exercise: string): boolean {
+  return /(sentadilla|squat|zancada|lunge|hip thrust|peso muerto|deadlift|prensa|gemelo|femoral)/i.test(exercise);
+}
+
+/**
+ * Multiplicador para igualar rendimiento medio mujer/hombre.
+ * Ratios F/M típicos (fuerza relativa / endurance): tren superior ~0.62,
+ * tren inferior ~0.72, isométrico de tronco ~0.93.
+ */
+function genderFactor(type: ChallengeScoreType, exercise: string, gender?: Gender): number {
+  if (gender !== 'mujer') return 1;
+  if (type === 'seconds') return 1.08;
+  if (isPullUpLikeExercise(exercise)) return 1.55;
+  if (isLowerBodyExercise(exercise)) return 1.32;
+  return 1.4;
 }
 
 const REF_BW = 70;
@@ -111,9 +129,9 @@ export function computeChallengeScore(
     return Math.round(v * 1000) / 1000;
   }
 
-  let bw = bodyWeight > 0 ? bodyWeight : 70;
+  const bw = bodyWeight > 0 ? bodyWeight : 70;
   const g: Gender = gender === 'mujer' ? 'mujer' : 'hombre';
-  const gf = genderFactor(g);
+  const gf = genderFactor(type, exercise, g);
   const mode = normalizeBodyWeightScoring(bodyWeightScoring);
   const rel = bw / REF_BW;
 
@@ -121,13 +139,11 @@ export function computeChallengeScore(
     case 'weight':
       return computeIpfGlPoints(v, bw, exercise, g);
     case 'max_reps': {
-      const bwF = repsBodyWeightFactor(mode, rel, exercise);
-      const score = v * bwF * gf;
+      const score = v * repsBodyWeightFactor(mode, rel, exercise) * gf;
       return Math.round(score * 100) / 100;
     }
     case 'seconds': {
-      const bwF = secondsBodyWeightFactor(mode, rel);
-      const score = v * bwF * gf;
+      const score = v * secondsBodyWeightFactor(mode, rel) * gf;
       return Math.round(score * 100) / 100;
     }
     default:

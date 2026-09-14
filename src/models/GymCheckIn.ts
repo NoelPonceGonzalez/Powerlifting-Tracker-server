@@ -37,9 +37,9 @@ const GymCheckInSchema = new Schema<IGymCheckIn>(
       default: Date.now,
       index: true,
     },
+    // El índice se declara abajo con expireAfterSeconds; ponerlo también aquí lo duplica.
     expiresAt: {
       type: Date,
-      index: true,
     },
   },
   {

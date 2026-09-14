@@ -8,6 +8,8 @@ export interface IWorkoutSet extends Document {
   completed: boolean;
   rpe: string;
   inputMode?: 'kg' | 'pct';
+  mediaKey?: string | null;
+  mediaType?: 'image' | 'video' | null;
 }
 
 const WorkoutSetSchema = new Schema<IWorkoutSet>(
@@ -19,6 +21,8 @@ const WorkoutSetSchema = new Schema<IWorkoutSet>(
     completed: { type: Boolean, default: false },
     rpe: { type: String, default: '' },
     inputMode: { type: String, enum: ['kg', 'pct'] },
+    mediaKey: { type: String, default: null },
+    mediaType: { type: String, enum: ['image', 'video'], default: null },
   },
   { timestamps: false }
 );

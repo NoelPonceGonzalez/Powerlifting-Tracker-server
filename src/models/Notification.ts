@@ -7,7 +7,13 @@ export type NotificationType =
   | 'challenge_join'
   | 'challenge_winner'
   | 'friend_accepted'
-  | 'new_rm';
+  | 'new_rm'
+  | 'post_like'
+  | 'post_comment'
+  | 'coach_request'
+  | 'coach_accepted'
+  | 'group_invite'
+  | 'chat_request';
 
 export interface INotification extends Document {
   userId: mongoose.Types.ObjectId; // Usuario que recibe la notificación
@@ -38,6 +44,12 @@ const NotificationSchema = new Schema<INotification>(
         'challenge_winner',
         'friend_accepted',
         'new_rm',
+        'post_like',
+        'post_comment',
+        'coach_request',
+        'coach_accepted',
+        'group_invite',
+        'chat_request',
       ],
       required: true,
     },

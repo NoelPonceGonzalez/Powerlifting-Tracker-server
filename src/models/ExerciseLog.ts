@@ -15,6 +15,8 @@ export interface IExerciseLog extends Document {
     weight: number | null;
     completed: boolean;
     inputMode?: 'kg' | 'pct';
+    mediaKey?: string | null;
+    mediaType?: 'image' | 'video' | null;
   }>;
   createdAt: Date;
   updatedAt: Date;
@@ -27,6 +29,8 @@ const SetLogSchema = new Schema(
     weight: { type: Schema.Types.Mixed, default: null },
     completed: { type: Boolean, default: false },
     inputMode: { type: String, enum: ['kg', 'pct'] },
+    mediaKey: { type: String, default: null },
+    mediaType: { type: String, enum: ['image', 'video'], default: null },
   },
   { _id: false }
 );

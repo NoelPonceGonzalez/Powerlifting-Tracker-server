@@ -13,6 +13,7 @@ import { WorkoutSet } from '../models/WorkoutSet';
 import { HistoryTmSnapshot } from '../models/HistoryTmSnapshot';
 import { InternalExerciseMax } from '../models/InternalExerciseMax';
 import { ExerciseLog } from '../models/ExerciseLog';
+import { Routine } from '../models/Routine';
 
 const oid = (v: any) =>
   v instanceof mongoose.Types.ObjectId ? v : new mongoose.Types.ObjectId(String(v));
@@ -90,6 +91,8 @@ export async function assembleRoutinePlan(routineId: mongoose.Types.ObjectId) {
         : (te as { linkedClientKey?: string }).linkedClientKey
           ? { linkedTo: (te as { linkedClientKey?: string }).linkedClientKey }
           : {}),
+      ...(te.targetRpe ? { targetRpe: te.targetRpe } : {}),
+      ...(te.coachNote ? { coachNote: te.coachNote } : {}),
     };
   }
 
@@ -122,9 +125,13 @@ export async function assembleRoutinePlan(routineId: mongoose.Types.ObjectId) {
       const clientWeek = weekToClient(tw, `template-w${tw.slot}`);
       templateWeeks.push(clientWeek);
     }
-    /** Solo plantilla 4 semanas — el cliente materializa w1…w52 en memoria (respuesta HTTP ligera). */
+    /** Solo la plantilla del ciclo — el cliente materializa w1…w52 en memoria (respuesta HTTP ligera). */
     clientVersions.push({
       effectiveFromWeek: v.effectiveFromWeek,
+      cycleLength:
+        Number.isFinite((v as { cycleLength?: number }).cycleLength) && (v as { cycleLength: number }).cycleLength >= 1
+          ? (v as { cycleLength: number }).cycleLength
+          : Math.max(1, templateWeeks.length),
       weeks: templateWeeks,
     });
     latestBaseTemplate = templateWeeks;
@@ -187,6 +194,7 @@ export async function assembleRoutineLogs(routineId: mongoose.Types.ObjectId) {
           weight: ws.weight ?? null,
           completed: !!ws.completed,
           ...(ws.inputMode ? { inputMode: ws.inputMode } : {}),
+          ...(ws.mediaKey ? { mediaKey: ws.mediaKey, mediaType: ws.mediaType || 'video' } : {}),
         })),
       };
     }
@@ -278,6 +286,24 @@ function inferCycleLengthCl(input: DisassemblePlanInput, rawTemplate: any[]): nu
   return 4;
 }
 
+/** Coloca las semanas recibidas en las posiciones 1…cl del ciclo, rellenando los huecos con la primera. */
+function buildTemplateSlots(rawWeeks: any[], cycleLength: number): any[] {
+  const cl = Math.max(1, Math.min(52, cycleLength));
+  const bySlot = new Map<number, any>();
+  for (const tpl of rawWeeks) {
+    const slot = Math.min(cl, Math.max(1, Number(tpl.number ?? tpl.slot ?? 1)));
+    if (!bySlot.has(slot)) bySlot.set(slot, { ...tpl, number: slot });
+  }
+  return Array.from({ length: cl }, (_, i) => {
+    const slot = i + 1;
+    const w = bySlot.get(slot);
+    if (w) return w;
+    const fb = bySlot.get(1) ?? rawWeeks[0];
+    if (!fb) return { id: `empty-${slot}`, number: slot, days: [] };
+    return { ...fb, number: slot, id: fb.id ?? `template-w${slot}` };
+  });
+}
+
 /** Borra el plan viejo y guarda el nuevo en colecciones normalizadas. */
 export async function disassemblePlanToCollections(input: DisassemblePlanInput) {
   const { routineId } = input;
@@ -302,19 +328,7 @@ export async function disassemblePlanToCollections(input: DisassemblePlanInput) 
   if (rawTemplate.length === 0) return;
 
   const cl = inferCycleLengthCl(input, rawTemplate);
-  const bySlot = new Map<number, any>();
-  for (const tpl of rawTemplate) {
-    const slot = Math.min(cl, Math.max(1, Number(tpl.number ?? tpl.slot ?? 1)));
-    if (!bySlot.has(slot)) bySlot.set(slot, { ...tpl, number: slot });
-  }
-  const templateSource = Array.from({ length: cl }, (_, i) => {
-    const slot = i + 1;
-    const w = bySlot.get(slot);
-    if (w) return w;
-    const fb = bySlot.get(1) ?? rawTemplate[0];
-    if (!fb) return { id: `empty-${slot}`, number: slot, days: [] };
-    return { ...fb, number: slot, id: fb.id ?? `template-w${slot}` };
-  }) as any[];
+  const templateSource = buildTemplateSlots(rawTemplate, cl);
   if (templateSource.length === 0) return;
 
   const effectiveVersions = input.versions?.length
@@ -324,14 +338,27 @@ export async function disassemblePlanToCollections(input: DisassemblePlanInput) 
   
   for (let vi = 0; vi < effectiveVersions.length; vi++) {
     const cv = effectiveVersions[vi];
+    /**
+     * Cada versión guarda SUS semanas y SU ciclo. Antes se escribía la plantilla más reciente en todas las
+     * versiones, así que al retroceder a una semana ya entrenada aparecía el plan nuevo en vez del que hubo.
+     */
+    const ownWeeks: any[] = Array.isArray(cv.weeks) && cv.weeks.length > 0 ? cv.weeks : [];
+    const versionCl = Number.isFinite(cv.cycleLength) && cv.cycleLength >= 1
+      ? Math.max(1, Math.min(52, cv.cycleLength))
+      : ownWeeks.length > 0
+        ? Math.max(1, Math.min(52, ownWeeks.length))
+        : cl;
+    const versionWeeks = ownWeeks.length > 0 ? buildTemplateSlots(ownWeeks, versionCl) : templateSource;
+
     const pv = await ProgramVersion.create({
       routineId,
       effectiveFromWeek: cv.effectiveFromWeek ?? 1,
+      cycleLength: ownWeeks.length > 0 ? versionCl : cl,
       sortOrder: vi,
     });
 
-    for (const tplWeek of templateSource) {
-      const slot = Math.min(cl, Math.max(1, Number(tplWeek.number ?? tplWeek.slot ?? 1)));
+    for (const tplWeek of versionWeeks) {
+      const slot = Math.max(1, Number(tplWeek.number ?? tplWeek.slot ?? 1));
       const tw = await TemplateWeek.create({
         programVersionId: pv._id,
         slot,
@@ -364,6 +391,8 @@ export async function disassemblePlanToCollections(input: DisassemblePlanInput) 
             mode: ex.mode || 'weight',
             linkedTrainingMaxId: safeLinkedTrainingMaxId(ex),
             linkedClientKey: linkedClientKeyFromExercise(ex),
+            targetRpe: ex.targetRpe || undefined,
+            coachNote: ex.coachNote || undefined,
           });
         }
       }
@@ -517,6 +546,8 @@ export async function disassembleLogsToCollections(input: DisassembleLogsInput) 
             completed: !!s.completed,
             rpe: s.rpe ?? '',
             inputMode: s.inputMode === 'kg' || s.inputMode === 'pct' ? s.inputMode : undefined,
+            mediaKey: typeof s.mediaKey === 'string' && s.mediaKey ? s.mediaKey : null,
+            mediaType: s.mediaType === 'image' || s.mediaType === 'video' ? s.mediaType : null,
           }))
         );
       }
@@ -560,32 +591,38 @@ export async function loadHistoryTmSnapshotsAsRecord(historyEntryId: mongoose.Ty
 //  Tras cambiar la plantilla (PATCH /plan): borrar logs/series de ejercicios que ya no existen
 // ---------------------------------------------------------------------------
 
-function weekTypeSlotFromPlanWeek(planWeek: number): number {
-  return ((Math.max(1, planWeek) - 1) % 4) + 1;
+function weekTypeSlotFromPlanWeek(planWeek: number, cycleLength = 4): number {
+  const cl = Math.max(1, Math.min(52, cycleLength));
+  return ((Math.max(1, planWeek) - 1) % cl) + 1;
 }
 
 async function programVersionForPlanWeek(
   routineId: mongoose.Types.ObjectId,
   planWeek: number
-): Promise<{ _id: mongoose.Types.ObjectId; effectiveFromWeek?: number } | null> {
+): Promise<{ _id: mongoose.Types.ObjectId; effectiveFromWeek?: number; cycleLength?: number } | null> {
   const versions = await ProgramVersion.find({ routineId }).sort({ effectiveFromWeek: 1 }).lean();
   if (!versions.length) return null;
   let chosen = versions[0];
   for (const v of versions) {
     if ((v.effectiveFromWeek ?? 1) <= planWeek) chosen = v;
   }
-  return chosen as { _id: mongoose.Types.ObjectId; effectiveFromWeek?: number };
+  return chosen as { _id: mongoose.Types.ObjectId; effectiveFromWeek?: number; cycleLength?: number };
 }
 
 /** Número de ejercicios en plantilla para (semana del plan, día 0–6). */
 export async function getExpectedExerciseCountForSession(
   routineId: mongoose.Types.ObjectId,
   planWeek: number,
-  planDayIndex: number
+  planDayIndex: number,
+  cycleLength = 4
 ): Promise<number> {
   const pv = await programVersionForPlanWeek(routineId, planWeek);
   if (!pv) return 0;
-  const slot = weekTypeSlotFromPlanWeek(planWeek);
+  /** El ciclo de la versión que estaba vigente esa semana, no el de la rutina hoy. */
+  const slot = weekTypeSlotFromPlanWeek(
+    planWeek,
+    Number.isFinite(pv.cycleLength) && pv.cycleLength! >= 1 ? pv.cycleLength! : cycleLength
+  );
   const tw = await TemplateWeek.findOne({ programVersionId: oid(pv._id), slot }).lean();
   if (!tw) return 0;
   const td = await TemplateDay.findOne({ templateWeekId: oid(tw._id), dayIndex: planDayIndex }).lean();
@@ -598,9 +635,15 @@ export async function getExpectedExerciseCountForSession(
  * Debe llamarse después de `disassemblePlanToCollections` (p. ej. PATCH /plan).
  */
 export async function pruneWorkoutDataAfterPlanChange(routineId: mongoose.Types.ObjectId): Promise<void> {
+  /** Sin el ciclo real, una rutina con ciclo ≠ 4 buscaba una posición inexistente y borraba series ya registradas. */
+  const routineDoc = await Routine.findById(routineId).select('cycleLength').lean();
+  const cycleLength = Number.isFinite((routineDoc as { cycleLength?: number } | null)?.cycleLength)
+    ? Math.max(1, Math.min(52, (routineDoc as { cycleLength: number }).cycleLength))
+    : 4;
+
   const sessions = await WorkoutSession.find({ routineId }).select('_id planWeek planDayIndex').lean();
   for (const s of sessions) {
-    const expected = await getExpectedExerciseCountForSession(routineId, s.planWeek, s.planDayIndex);
+    const expected = await getExpectedExerciseCountForSession(routineId, s.planWeek, s.planDayIndex, cycleLength);
     const wes = await WorkoutExercise.find({ sessionId: oid(s._id) })
       .select('_id exerciseIndex')
       .lean();
@@ -618,7 +661,8 @@ export async function pruneWorkoutDataAfterPlanChange(routineId: mongoose.Types.
     const exp = await getExpectedExerciseCountForSession(
       routineId,
       parsed.planWeek,
-      parsed.planDayIndex
+      parsed.planDayIndex,
+      cycleLength
     );
     if (parsed.exerciseIndex > exp) {
       await ExerciseLog.deleteOne({ _id: doc._id });

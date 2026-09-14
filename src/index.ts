@@ -3,7 +3,7 @@ import cors from 'cors';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
-import { connectDB } from './config/database';
+import { connectDB, isDbConnected, default as mongooseConnection } from './config/database';
 import { config, getCorsAllowedOrigins } from './config/env';
 import { logger } from './utils/logger';
 import authRoutes from './routes/auth';
@@ -14,6 +14,8 @@ import checkinsRoutes from './routes/checkins';
 import notificationsRoutes from './routes/notifications';
 import challengesRoutes from './routes/challenges';
 import internalExerciseMaxesRoutes from './routes/internalExerciseMaxes';
+import feedRoutes from './routes/feed';
+import mediaRoutes from './routes/media';
 import sseRoutes from './routes/sse';
 import { formatApiRequestLogLine } from './utils/apiRequestLogLabel';
 import { processFinishedChallengeWinnerNotifications } from './utils/challengeFinishedNotifications';
@@ -56,7 +58,19 @@ app.use((req, res, next) => {
 // Health check
 app.get('/health', (req, res) => {
   logger.info('GET /health - Health check solicitado');
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  res.json({
+    status: 'ok',
+    db: isDbConnected() ? 'connected' : 'disconnected',
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// Sin BD, mongoose encola las consultas y el cliente se queda colgado hasta el timeout.
+app.use('/api', (req, res, next) => {
+  if (isDbConnected()) return next();
+  return res.status(503).json({
+    error: 'La base de datos no está conectada. Inténtalo de nuevo en unos segundos.',
+  });
 });
 
 // Routes
@@ -68,6 +82,8 @@ app.use('/api/checkins', checkinsRoutes);
 app.use('/api/notifications', notificationsRoutes);
 app.use('/api/challenges', challengesRoutes);
 app.use('/api/internal-exercise-maxes', internalExerciseMaxesRoutes);
+app.use('/api/feed', feedRoutes);
+app.use('/api/media', mediaRoutes);
 app.use('/api/sse', sseRoutes);
 
 // --- Interfaz web (React) en el mismo puerto: necesaria para la app Expo (WebView → GET /) ---
@@ -127,27 +143,42 @@ const startServer = async () => {
     logger.info('Iniciando servidor...');
     await connectDB();
 
-    const { GymCheckIn } = await import('./models/GymCheckIn');
-    const { computeCheckInExpiresAt } = await import('./utils/checkInExpires');
-    const legacyCheckIns = await GymCheckIn.find({ expiresAt: { $exists: false } })
-      .select('_id timestamp time')
-      .lean()
-      .exec();
-    for (const doc of legacyCheckIns) {
-      await GymCheckIn.updateOne(
-        { _id: doc._id },
-        {
-          $set: {
-            expiresAt: computeCheckInExpiresAt(new Date(doc.timestamp as Date), String(doc.time)),
-          },
-        }
-      );
-    }
-    if (legacyCheckIns.length > 0) {
-      logger.info(`GymCheckIn: backfill expiresAt en ${legacyCheckIns.length} documento(s)`);
-    }
+    /** Mantenimiento que necesita la BD. Nunca debe impedir que el HTTP levante. */
+    const runDbMaintenance = async () => {
+      const { GymCheckIn } = await import('./models/GymCheckIn');
+      const { computeCheckInExpiresAt } = await import('./utils/checkInExpires');
+      const legacyCheckIns = await GymCheckIn.find({ expiresAt: { $exists: false } })
+        .select('_id timestamp time')
+        .lean()
+        .exec();
+      for (const doc of legacyCheckIns) {
+        await GymCheckIn.updateOne(
+          { _id: doc._id },
+          {
+            $set: {
+              expiresAt: computeCheckInExpiresAt(new Date(doc.timestamp as Date), String(doc.time)),
+            },
+          }
+        );
+      }
+      if (legacyCheckIns.length > 0) {
+        logger.info(`GymCheckIn: backfill expiresAt en ${legacyCheckIns.length} documento(s)`);
+      }
+      await GymCheckIn.syncIndexes().catch(e => logger.warn('syncIndexes GymCheckIn', e));
 
-    await GymCheckIn.syncIndexes().catch(e => logger.warn('syncIndexes GymCheckIn', e));
+      const { ensureStoryTtlGrace, startStoryCleanup } = await import('./utils/storyCleanup');
+      await ensureStoryTtlGrace().catch(e => logger.warn('TTL de historias', e));
+      startStoryCleanup();
+    };
+
+    if (isDbConnected()) {
+      await runDbMaintenance().catch(e => logger.warn('Mantenimiento de BD omitido', e));
+    } else {
+      // Sin BD el servidor arranca igual; el mantenimiento se hace al reconectar.
+      mongooseConnection.once('connected', () => {
+        void runDbMaintenance().catch(e => logger.warn('Mantenimiento de BD omitido', e));
+      });
+    }
     
     const server = app.listen(Number(config.port), '0.0.0.0', () => {
       const startupMessage = `Servidor corriendo en puerto ${config.port}`;
@@ -175,7 +206,11 @@ const startServer = async () => {
       } else {
         console.log(`\n📱 Interfaz web: estática desde client/dist (GET /)\n`);
       }
-      console.log(`\n📧 Email configurado: ${config.email.user}`);
+      console.log(
+        config.email.enabled
+          ? `\n📧 Email configurado: ${config.email.user}`
+          : `\n📧 Email sin configurar (EMAIL_USER / EMAIL_PASS): los códigos de verificación salen por consola`
+      );
       console.log(`\n⏳ Esperando conexiones...\n`);
       logger.info(startupMessage);
       logger.info(`📁 Logs guardados en: ${process.cwd()}/logs/`);

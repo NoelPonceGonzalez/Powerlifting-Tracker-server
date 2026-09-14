@@ -1,7 +1,9 @@
 import express, { Request, Response } from 'express';
 import mongoose from 'mongoose';
+import multer from 'multer';
 import { authenticateToken } from '../middleware/auth';
 import { Routine } from '../models/Routine';
+import { User } from '../models/User';
 import { TrainingMax } from '../models/TrainingMax';
 import { HistoryEntry } from '../models/HistoryEntry';
 import { HistoryTmSnapshot } from '../models/HistoryTmSnapshot';
@@ -14,6 +16,7 @@ import { WorkoutExercise } from '../models/WorkoutExercise';
 import { WorkoutSet } from '../models/WorkoutSet';
 import { body, validationResult } from 'express-validator';
 import { broadcastSse } from '../utils/sse';
+import { isSupportedMediaType, mediaKindFromMime, mediaStorage } from '../utils/mediaStorage';
 import {
   assembleFullRoutine,
   assembleRoutinePlan,
@@ -25,6 +28,11 @@ import {
 } from '../utils/assembleRoutine';
 
 const router = express.Router();
+
+const setMediaUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 80 * 1024 * 1024 },
+});
 const oid = (v: any) =>
   v instanceof mongoose.Types.ObjectId ? v : new mongoose.Types.ObjectId(String(v));
 
@@ -32,6 +40,26 @@ const oid = (v: any) =>
 function parseSameTemplateAllWeeks(v: unknown): boolean {
   if (v === false || v === 'false' || v === 0) return false;
   return true;
+}
+
+function ownerIdOf(routine: { userId: any }): string {
+  return String(routine.userId);
+}
+
+function notifyRoutineChange(routine: { userId: any }, editorId: string) {
+  const owner = ownerIdOf(routine);
+  const ids = owner === String(editorId) ? [editorId] : [String(editorId), owner];
+  broadcastSse(ids, 'routine_update');
+}
+
+/** Dueño o entrenador vinculado al dueño. */
+async function findEditableRoutine(editorId: string, routineId: string) {
+  const owned = await Routine.findOne({ _id: routineId, userId: editorId });
+  if (owned) return owned;
+  const any = await Routine.findById(routineId);
+  if (!any) return null;
+  const linked = await User.findOne({ _id: any.userId, coachId: editorId }).select('_id').lean();
+  return linked ? any : null;
 }
 
 // GET /api/routines
@@ -57,15 +85,24 @@ router.post(
       if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
       const userId = (req as any).user.userId;
-      const uid = oid(userId);
-      const { name, weeks, baseTemplate, weekTypeOverrides, versions } = req.body;
+      const { name, weeks, baseTemplate, weekTypeOverrides, versions, forAthleteId } = req.body;
 
-      const existingRoutines = await Routine.countDocuments({ userId });
+      let ownerId = userId;
+      if (forAthleteId) {
+        if (!mongoose.isValidObjectId(forAthleteId)) {
+          return res.status(400).json({ error: 'Alumno inválido' });
+        }
+        const linked = await User.findOne({ _id: forAthleteId, coachId: userId }).select('_id').lean();
+        if (!linked) return res.status(403).json({ error: 'No eres su entrenador' });
+        ownerId = String(forAthleteId);
+      }
+
+      const existingRoutines = await Routine.countDocuments({ userId: ownerId });
       const isActive = existingRoutines === 0 || req.body.isActive === true;
-      if (isActive) await Routine.updateMany({ userId }, { isActive: false });
+      if (isActive) await Routine.updateMany({ userId: ownerId }, { isActive: false });
 
       const routine = await Routine.create({
-        userId,
+        userId: ownerId,
         name,
         isActive,
         sameTemplateAllWeeks: parseSameTemplateAllWeeks(req.body.sameTemplateAllWeeks),
@@ -90,7 +127,7 @@ router.post(
       await pruneWorkoutDataAfterPlanChange(rid);
 
       const assembled = await assembleFullRoutine(routine);
-      broadcastSse([userId], 'routine_update');
+      notifyRoutineChange(routine, userId);
       res.status(201).json(assembled);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -98,11 +135,27 @@ router.post(
   }
 );
 
+// GET /api/routines/athlete/:athleteId — rutina activa del alumno (solo su entrenador)
+router.get('/athlete/:athleteId', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).user.userId;
+    const athleteId = req.params.athleteId;
+    if (!mongoose.isValidObjectId(athleteId)) return res.status(400).json({ error: 'Alumno inválido' });
+    const linked = await User.findOne({ _id: athleteId, coachId: userId }).select('_id').lean();
+    if (!linked) return res.status(403).json({ error: 'No eres su entrenador' });
+    const routine = await Routine.findOne({ userId: athleteId, isActive: true });
+    if (!routine) return res.status(404).json({ error: 'El alumno no tiene rutina activa' });
+    res.json(await assembleFullRoutine(routine));
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // PATCH /api/routines/:id/plan  (bulk — kept as fallback)
 router.patch('/:id/plan', authenticateToken, async (req: Request, res: Response) => {
   try {
     const userId = (req as any).user.userId;
-    const routine = await Routine.findOne({ _id: req.params.id, userId });
+    const routine = await findEditableRoutine(userId, req.params.id);
     if (!routine) return res.status(404).json({ error: 'Rutina no encontrada' });
 
     const { baseTemplate, weekTypeOverrides, versions, sameTemplateAllWeeks, hiddenFromSocial } = req.body;
@@ -140,7 +193,7 @@ router.patch('/:id/plan', authenticateToken, async (req: Request, res: Response)
       await pruneWorkoutDataAfterPlanChange(rid);
     }
 
-    broadcastSse([userId], 'routine_update');
+    notifyRoutineChange(routine, userId);
     res.json(await assembleFullRoutine(routine));
   } catch (error: any) {
     res.status(500).json({ error: error.message });
@@ -196,7 +249,7 @@ function safeLinkedTrainingMaxId(linkedTo?: string): mongoose.Types.ObjectId | u
 router.patch('/:id/exercises/:exId', authenticateToken, async (req: Request, res: Response) => {
   try {
     const userId = (req as any).user.userId;
-    const routine = await Routine.findOne({ _id: req.params.id, userId });
+    const routine = await findEditableRoutine(userId, req.params.id);
     if (!routine) return res.status(404).json({ error: 'Rutina no encontrada' });
 
     const te = await TemplateExercise.findById(req.params.exId);
@@ -247,7 +300,7 @@ router.patch('/:id/exercises/:exId', authenticateToken, async (req: Request, res
 router.delete('/:id/exercises/:exId', authenticateToken, async (req: Request, res: Response) => {
   try {
     const userId = (req as any).user.userId;
-    const routine = await Routine.findOne({ _id: req.params.id, userId });
+    const routine = await findEditableRoutine(userId, req.params.id);
     if (!routine) return res.status(404).json({ error: 'Rutina no encontrada' });
 
     const te = await TemplateExercise.findById(req.params.exId).lean();
@@ -307,7 +360,7 @@ router.delete('/:id/exercises/:exId', authenticateToken, async (req: Request, re
 router.post('/:id/days/:dayId/exercises', authenticateToken, async (req: Request, res: Response) => {
   try {
     const userId = (req as any).user.userId;
-    const routine = await Routine.findOne({ _id: req.params.id, userId });
+    const routine = await findEditableRoutine(userId, req.params.id);
     if (!routine) return res.status(404).json({ error: 'Rutina no encontrada' });
 
     const td = await TemplateDay.findById(req.params.dayId).lean();
@@ -348,7 +401,7 @@ router.post('/:id/days/:dayId/exercises', authenticateToken, async (req: Request
 router.patch('/:id/days/:dayId', authenticateToken, async (req: Request, res: Response) => {
   try {
     const userId = (req as any).user.userId;
-    const routine = await Routine.findOne({ _id: req.params.id, userId });
+    const routine = await findEditableRoutine(userId, req.params.id);
     if (!routine) return res.status(404).json({ error: 'Rutina no encontrada' });
 
     const td = await TemplateDay.findById(req.params.dayId);
@@ -391,6 +444,31 @@ router.patch('/:id/logs', authenticateToken, async (req: Request, res: Response)
   }
 });
 
+/** Vídeo o foto de una serie: queda en el log, no en el chat. */
+router.post(
+  '/:id/set-media',
+  authenticateToken,
+  setMediaUpload.single('file'),
+  async (req: Request, res: Response) => {
+    try {
+      const userId = (req as any).user.userId;
+      const file = (req as Request & { file?: Express.Multer.File }).file;
+      if (!file) return res.status(400).json({ error: 'Adjunta un vídeo o una foto' });
+      if (!isSupportedMediaType(file.mimetype)) {
+        return res.status(400).json({ error: 'Solo fotos (JPG, PNG, WEBP, GIF) o vídeos (MP4, MOV, WEBM)' });
+      }
+      const routine = await Routine.findOne({ _id: req.params.id, userId });
+      if (!routine) return res.status(404).json({ error: 'Rutina no encontrada' });
+
+      const stored = await mediaStorage().save(file.buffer, file.mimetype);
+      const mediaType = mediaKindFromMime(file.mimetype);
+      res.status(201).json({ mediaKey: stored.key, mediaType });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  }
+);
+
 // PUT /api/routines/:id/activate
 router.put('/:id/activate', authenticateToken, async (req: Request, res: Response) => {
   try {
@@ -412,7 +490,7 @@ router.put('/:id/activate', authenticateToken, async (req: Request, res: Respons
 router.get('/:id', authenticateToken, async (req: Request, res: Response) => {
   try {
     const userId = (req as any).user.userId;
-    const routine = await Routine.findOne({ _id: req.params.id, userId });
+    const routine = await findEditableRoutine(userId, req.params.id);
     if (!routine) return res.status(404).json({ error: 'Rutina no encontrada' });
     res.json(await assembleFullRoutine(routine));
   } catch (error: any) {
@@ -431,11 +509,13 @@ router.put(
       if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
       const userId = (req as any).user.userId;
-      const uid = oid(userId);
       const { name, baseTemplate, weekTypeOverrides, versions, weeks, logs, isActive, sameTemplateAllWeeks, hiddenFromSocial } = req.body;
 
-      const routine = await Routine.findOne({ _id: req.params.id, userId });
+      const routine = await findEditableRoutine(userId, req.params.id);
       if (!routine) return res.status(404).json({ error: 'Rutina no encontrada' });
+      const ownerId = ownerIdOf(routine);
+      const isOwner = ownerId === String(userId);
+      const uid = oid(ownerId);
 
       if (name !== undefined) routine.name = name;
       if (sameTemplateAllWeeks !== undefined) {
@@ -475,7 +555,7 @@ router.put(
       }
 
       if (isActive === true) {
-        await Routine.updateMany({ userId, _id: { $ne: req.params.id } }, { isActive: false });
+        await Routine.updateMany({ userId: ownerId, _id: { $ne: req.params.id } }, { isActive: false });
         routine.isActive = true;
       } else if (isActive === false) {
         routine.isActive = false;
@@ -501,11 +581,11 @@ router.put(
         await pruneWorkoutDataAfterPlanChange(rid);
       }
 
-      if (logs !== undefined && typeof logs === 'object') {
+      if (isOwner && logs !== undefined && typeof logs === 'object') {
         await disassembleLogsToCollections({ routineId: rid, userId: uid, logs });
       }
 
-      broadcastSse([userId], 'routine_update');
+      notifyRoutineChange(routine, userId);
       res.json(await assembleFullRoutine(routine));
     } catch (error: any) {
       res.status(500).json({ error: error.message });
