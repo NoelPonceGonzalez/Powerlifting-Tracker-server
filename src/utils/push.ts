@@ -55,6 +55,18 @@ function buildPushDataPayload(data?: Record<string, any>): Record<string, string
   } else if (type === 'gym_checkin' || type === 'same_time_confirmation') {
     screen = 'social';
     tab = 'checkins';
+  } else if (
+    type === 'chat_message' ||
+    type === 'chat_request' ||
+    type === 'group_invite' ||
+    type === 'post_like' ||
+    type === 'post_comment' ||
+    type === 'post_comment_reply' ||
+    type === 'coach_request' ||
+    type === 'coach_accepted'
+  ) {
+    screen = 'social';
+    tab = 'friends';
   } else if (type === '') {
     screen = 'dashboard';
   } else {

@@ -162,6 +162,7 @@ router.put(
     body('routineId').isMongoId().withMessage('routineId inválido'),
     body('value').optional().isNumeric().withMessage('El valor debe ser numérico'),
     body('name').optional().trim().notEmpty().withMessage('El nombre no puede estar vacío'),
+    body('correction').optional().isBoolean(),
   ],
   async (req: Request, res: Response) => {
     try {
@@ -171,7 +172,7 @@ router.put(
       }
 
       const userId = new mongoose.Types.ObjectId((req as any).user.userId);
-      const { name, value, mode, linkedExercise, sharedToSocial, routineId } = req.body;
+      const { name, value, mode, linkedExercise, sharedToSocial, routineId, correction } = req.body;
 
       const routine = await assertRoutineOwnedOrCoach(userId, routineId);
       if (!routine) {
@@ -215,8 +216,16 @@ router.put(
       broadcastSse([userId.toString(), String(ownerId)], 'routine_update');
 
       const newValue = typeof value === 'number' ? value : typeof value === 'string' ? parseFloat(value) : NaN;
+      /** Corrección: solo el pico erróneo (o la línea plana de alta). No aplasta PR intermedios. */
+      if (correction === true && Number.isFinite(newValue) && Number.isFinite(prevValue) && newValue !== prevValue) {
+        const filter =
+          newValue < prevValue
+            ? { trainingMaxId: trainingMax._id, value: { $gte: prevValue } }
+            : { trainingMaxId: trainingMax._id, value: prevValue };
+        await HistoryTmSnapshot.updateMany(filter, { $set: { value: newValue } });
+      }
       // Solo se avisa de los ejercicios que el usuario comparte: el resto son privados.
-      if (Number.isFinite(newValue) && newValue > prevValue && updated.sharedToSocial) {
+      if (!correction && Number.isFinite(newValue) && newValue > prevValue && updated.sharedToSocial) {
         (async () => {
           try {
             const friendships = await Friendship.find({

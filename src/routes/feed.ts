@@ -8,7 +8,9 @@ import { PostComment } from '../models/PostComment';
 import { Friendship } from '../models/Friendship';
 import { Notification } from '../models/Notification';
 import { User } from '../models/User';
+import { ChatMessage } from '../models/ChatMessage';
 import { isSupportedMediaType, mediaKindFromMime, mediaStorage } from '../utils/mediaStorage';
+import { broadcastSse } from '../utils/sse';
 
 const router = express.Router();
 
@@ -72,6 +74,7 @@ function serializePost(post: any, viewerId: string) {
     caption: post.caption ?? '',
     likeCount: likes.length,
     likedByMe: likes.some((l: any) => String(l) === String(viewerId)),
+    viewedByMe: views.some((v: any) => String(v?._id ?? v) === String(viewerId)),
     commentCount: post.commentCount ?? 0,
     createdAt: post.createdAt,
     expiresAt: post.expiresAt ?? null,
@@ -101,7 +104,7 @@ router.post(
         return res.status(415).json({ error: 'Formato no admitido: usa JPG, PNG, WEBP, GIF, MP4, MOV o WEBM' });
       }
 
-      const kind = String(req.body.kind || 'post') === 'story' ? 'story' : 'post';
+      const kind = String(req.body.kind || 'story') === 'post' ? 'post' : 'story';
       const caption = String(req.body.caption || '').trim().slice(0, 2200);
       const stored = await mediaStorage().save(file.buffer, file.mimetype);
 
@@ -238,14 +241,18 @@ router.post('/posts/:id/like', authenticateToken, async (req: Request, res: Resp
 
     if (!already && String(post.userId) !== String(userId)) {
       const me = await User.findById(userId).select('name').lean();
+      const story = post.kind === 'story';
       await Notification.create({
         userId: post.userId,
         type: 'post_like',
         title: 'Nuevo me gusta',
-        message: `A ${me?.name || 'alguien'} le gusta tu publicación`,
+        message: story
+          ? `A ${me?.name || 'alguien'} le gusta tu historia`
+          : `A ${me?.name || 'alguien'} le gusta tu publicación`,
         relatedUserId: toObjectId(userId),
         relatedData: { postId: String(post._id) },
       }).catch(() => {});
+      broadcastSse([String(post.userId)], 'social_update');
     }
 
     res.json({ likeCount: post.likes.length, likedByMe: !already });
@@ -307,16 +314,76 @@ router.post(
       await post.save();
 
       const me = await User.findById(userId).select('name avatar').lean();
-      if (String(post.userId) !== String(userId)) {
+      const story = post.kind === 'story';
+      const snippet = story
+        ? `${me?.name || 'Alguien'} ha respondido a tu historia`
+        : `${me?.name || 'Alguien'}: ${created.text.slice(0, 80)}`;
+      const ownerId = String(post.userId);
+      if (ownerId !== String(userId)) {
         await Notification.create({
           userId: post.userId,
           type: 'post_comment',
-          title: 'Nuevo comentario',
-          message: `${me?.name || 'Alguien'}: ${created.text.slice(0, 80)}`,
+          title: story ? 'Historia' : 'Nuevo comentario',
+          message: snippet,
           relatedUserId: toObjectId(userId),
           relatedData: { postId: String(post._id) },
         }).catch(() => {});
       }
+
+      if (story && ownerId !== String(userId)) {
+        const chat = await ChatMessage.create({
+          from: toObjectId(userId),
+          to: post.userId,
+          text: created.text,
+          storyReply: {
+            postId: String(post._id),
+            mediaKey: post.mediaKey,
+            mediaType: post.mediaType,
+            caption: post.caption || '',
+          },
+        });
+        const reply = {
+          postId: String(post._id),
+          mediaKey: post.mediaKey,
+          mediaType: post.mediaType,
+          caption: post.caption || '',
+        };
+        const base = {
+          id: String(chat._id),
+          text: chat.text,
+          storyReply: reply,
+          mediaKey: null,
+          mediaType: null,
+          createdAt: chat.createdAt.toISOString(),
+          from: { id: userId, name: me?.name || 'Atleta', avatar: me?.avatar || null },
+        };
+        broadcastSse([ownerId], 'chat_message', {
+          message: { ...base, mine: false, author: base.from },
+          peerId: userId,
+        });
+        broadcastSse([userId], 'chat_message', {
+          message: { ...base, mine: true, author: base.from },
+          peerId: ownerId,
+        });
+      }
+      const otherCommenters = await PostComment.distinct('userId', {
+        postId: post._id,
+        userId: { $nin: [toObjectId(userId), post.userId] },
+      });
+      if (otherCommenters.length > 0) {
+        await Notification.insertMany(
+          otherCommenters.map(uid => ({
+            userId: uid,
+            type: 'post_comment_reply' as const,
+            title: 'Respuesta a tu comentario',
+            message: `${me?.name || 'Alguien'} ha respondido: ${created.text.slice(0, 80)}`,
+            relatedUserId: toObjectId(userId),
+            relatedData: { postId: String(post._id) },
+          }))
+        ).catch(() => {});
+      }
+      const notifyIds = [String(post.userId), ...otherCommenters.map(id => String(id))].filter(id => id !== String(userId));
+      if (notifyIds.length) broadcastSse(notifyIds, 'social_update');
 
       res.status(201).json({
         id: String(created._id),

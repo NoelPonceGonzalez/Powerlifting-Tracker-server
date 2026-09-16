@@ -16,6 +16,8 @@ export interface IRoutine extends Document {
   skippedWeeks?: number[];
   /** Semanas civiles donde «Saltar la semana» desplazó el ciclo (solo block mode). */
   shiftedAtCalendarWeeks?: number[];
+  /** Esta semana civil: días que no fuiste; las sesiones se corren solo aquí. */
+  calendarDayShifts?: { year: number; week: number; skippedDays: number[] }[];
   /** ISO: desde aquí los % de progreso en gráficos usan este punto como referencia (no modifica TM). */
   progressCheckpointAt?: Date;
   /** Snapshot de TM al momento del checkpoint ({ tmId: valor }). El baseline de % se toma de aquí. */
@@ -62,6 +64,16 @@ const RoutineSchema = new Schema<IRoutine>(
     },
     shiftedAtCalendarWeeks: {
       type: [Number],
+      default: [],
+    },
+    calendarDayShifts: {
+      type: [
+        {
+          year: { type: Number },
+          week: { type: Number },
+          skippedDays: { type: [Number], default: [] },
+        },
+      ],
       default: [],
     },
     progressCheckpointAt: {

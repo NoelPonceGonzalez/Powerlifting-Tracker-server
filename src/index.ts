@@ -4,7 +4,7 @@ import { existsSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { connectDB, isDbConnected, default as mongooseConnection } from './config/database';
-import { config, getCorsAllowedOrigins } from './config/env';
+import { config, getCorsAllowedOrigins, isAllowedVercelOrigin } from './config/env';
 import { logger } from './utils/logger';
 import authRoutes from './routes/auth';
 import routinesRoutes from './routes/routines';
@@ -33,7 +33,7 @@ const app = express();
 app.use(cors({
   origin: (origin, callback) => {
     const allowed = getCorsAllowedOrigins();
-    if (!origin || allowed.includes(origin)) {
+    if (!origin || allowed.includes(origin) || isAllowedVercelOrigin(origin)) {
       callback(null, true);
     } else {
       logger.warn(`CORS: origen no permitido: ${origin}`);

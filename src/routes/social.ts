@@ -14,11 +14,13 @@ import { CoachRequest } from '../models/CoachRequest';
 import { ChatMessage } from '../models/ChatMessage';
 import { ChatGroup } from '../models/ChatGroup';
 import { ChatGroupInvite } from '../models/ChatGroupInvite';
+import { ChatHide } from '../models/ChatHide';
 import { ChatRequest } from '../models/ChatRequest';
 import { body, validationResult } from 'express-validator';
 import { assembleFullRoutine } from '../utils/assembleRoutine';
 import { broadcastSse, isUserOnline } from '../utils/sse';
 import { isSupportedMediaType, mediaKindFromMime, mediaStorage } from '../utils/mediaStorage';
+import { chatMediaExpiresAt, isChatMediaLive } from '../utils/chatMedia';
 
 const router = express.Router();
 
@@ -301,7 +303,6 @@ router.get('/friends/:friendId/profile', authenticateToken, async (req: Request,
       ? await TrainingMax.find({
           userId: friendId,
           routineId: activeRoutine._id,
-          sharedToSocial: true,
         })
           .select('name value mode')
           .sort({ createdAt: 1 })
@@ -326,7 +327,12 @@ router.get('/friends/:friendId/profile', authenticateToken, async (req: Request,
       bio: friend.bio || '',
       coach: coach ? { id: String(coach._id), name: coach.name || 'Usuario', avatar: coach.avatar || null } : null,
       athleteCount,
-      trainingMaxes: sharedTms.map((t: any) => ({ name: t.name, value: t.value, mode: t.mode })),
+      trainingMaxes: sharedTms.map((t: any) => ({
+        id: String(t._id),
+        name: t.name,
+        value: t.value,
+        mode: t.mode,
+      })),
       ...(includeAllTms
         ? {
             trainingMaxesAll: allTms.map((t: any) => ({
@@ -411,6 +417,7 @@ router.get('/requests', authenticateToken, async (req: Request, res: Response) =
 
     const formatted = requests.map(r => ({
       id: r._id.toString(),
+      userId: (r.requester as any)?._id?.toString?.() || String((r.requester as any)?._id || ''),
       name: (r.requester as any).name || (r.requester as any).email,
       avatar: (r.requester as any).avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent((r.requester as any).name || (r.requester as any).email)}`,
       status: r.status,
@@ -794,10 +801,13 @@ router.get('/users/:userId/profile', authenticateToken, async (req: Request, res
       target.coachId ? User.findById(target.coachId).select('name avatar').lean() : null,
     ]);
 
-    /** Estado de «sé mi entrenador» del que mira hacia el perfil que está viendo. */
-    const coachRequest = isSelf
-      ? null
-      : await CoachRequest.findOne({ athlete: viewerId, coach: targetId }).lean();
+    /** Pedir que me entrene (yo soy el alumno) o invitarle a entrenarle (yo soy el coach). */
+    const [coachRequest, athleteInvite] = isSelf
+      ? [null, null]
+      : await Promise.all([
+          CoachRequest.findOne({ athlete: viewerId, coach: targetId }).lean(),
+          CoachRequest.findOne({ athlete: targetId, coach: viewerId }).lean(),
+        ]);
 
     const activeRoutine = isFriend
       ? await Routine.findOne({ userId: targetId, isActive: true }).select('_id name').lean()
@@ -825,6 +835,7 @@ router.get('/users/:userId/profile', authenticateToken, async (req: Request, res
       followerCount: friendCount + athleteCount,
       followingCount: friendCount + (target.coachId ? 1 : 0),
       coachRequestStatus: coachRequest?.status ?? 'none',
+      athleteInviteStatus: athleteInvite?.status ?? 'none',
       iAmTheirCoach: !isSelf && String(target.coachId || '') === String(viewerId),
       routineName: activeRoutine?.name ?? null,
       coach: coach ? { id: String(coach._id), name: coach.name || 'Usuario', avatar: coach.avatar || null } : null,
@@ -868,9 +879,6 @@ router.get('/users/:userId/training-maxes/:tmId/history', authenticateToken, asy
 
     const tm = await TrainingMax.findOne({ _id: tmId, userId: targetId }).lean();
     if (!tm) return res.status(404).json({ error: 'Marca no encontrada' });
-    if (!tm.sharedToSocial && !isSelf && !iAmCoach) {
-      return res.status(404).json({ error: 'Marca no encontrada' });
-    }
 
     const snaps = await HistoryTmSnapshot.find({ trainingMaxId: tm._id }).lean();
     const entries = snaps.length
@@ -973,14 +981,19 @@ router.delete('/me/coach', authenticateToken, async (req: Request, res: Response
   }
 });
 
-/** El alumno pide a un amigo que sea su entrenador; no pasa nada hasta que el otro acepta. */
+/** El alumno pide «entréneme» o el entrenador invita «te entreno». No cuenta hasta que el otro acepta. */
 router.post('/coach-requests', authenticateToken, async (req: Request, res: Response) => {
   try {
-    const athleteId = (req as any).user.userId;
-    const coachId = String(req.body.coachId || '');
+    const me = String((req as any).user.userId);
+    const asCoach = !!req.body.athleteId;
+    const athleteId = String(asCoach ? req.body.athleteId : me);
+    const coachId = String(asCoach ? me : req.body.coachId || '');
+    const initiatedBy = asCoach ? 'coach' : 'athlete';
 
-    if (!mongoose.isValidObjectId(coachId)) return res.status(400).json({ error: 'Entrenador inválido' });
-    if (coachId === String(athleteId)) return res.status(400).json({ error: 'No puedes ser tu propio entrenador' });
+    if (!mongoose.isValidObjectId(coachId) || !mongoose.isValidObjectId(athleteId)) {
+      return res.status(400).json({ error: 'Usuario inválido' });
+    }
+    if (coachId === athleteId) return res.status(400).json({ error: 'No puedes ser tu propio entrenador' });
 
     const friendship = await Friendship.findOne({
       status: 'accepted',
@@ -989,34 +1002,42 @@ router.post('/coach-requests', authenticateToken, async (req: Request, res: Resp
         { requester: coachId, recipient: athleteId },
       ],
     }).lean();
-    if (!friendship) return res.status(403).json({ error: 'Tu entrenador tiene que ser amigo tuyo' });
+    if (!friendship) return res.status(403).json({ error: 'Primero tenéis que ser amigos' });
 
-    const coach = await User.findById(coachId).select('name avatar').lean();
-    if (!coach) return res.status(404).json({ error: 'Usuario no encontrado' });
+    const [coach, athlete] = await Promise.all([
+      User.findById(coachId).select('name avatar').lean(),
+      User.findById(athleteId).select('name coachId').lean(),
+    ]);
+    if (!coach || !athlete) return res.status(404).json({ error: 'Usuario no encontrado' });
 
-    const meAthlete = await User.findById(athleteId).select('coachId').lean();
-    if (meAthlete?.coachId && String(meAthlete.coachId) !== coachId) {
-      return res.status(400).json({ error: 'Ya tienes un entrenador. Déjalo antes de pedir a otro.' });
+    if (athlete.coachId && String(athlete.coachId) !== coachId) {
+      return res.status(400).json({
+        error: asCoach ? 'Esta persona ya tiene entrenador' : 'Ya tienes un entrenador. Déjalo antes de pedir a otro.',
+      });
     }
 
     const existing = await CoachRequest.findOne({ athlete: athleteId, coach: coachId });
     if (existing?.status === 'accepted') {
-      return res.status(400).json({ error: 'Ya es tu entrenador' });
+      return res.status(400).json({ error: asCoach ? 'Ya le entrenas' : 'Ya es tu entrenador' });
     }
     if (existing) {
       existing.status = 'pending';
+      existing.initiatedBy = initiatedBy;
       await existing.save();
     } else {
-      await CoachRequest.create({ athlete: athleteId, coach: coachId, status: 'pending' });
+      await CoachRequest.create({ athlete: athleteId, coach: coachId, initiatedBy, status: 'pending' });
     }
 
-    const me = await User.findById(athleteId).select('name').lean();
+    const notifyUser = asCoach ? athleteId : coachId;
+    const fromName = asCoach ? coach.name : athlete.name;
     await Notification.create({
-      userId: coach._id,
+      userId: notifyUser,
       type: 'coach_request',
-      title: 'Te piden ser entrenador',
-      message: `${me?.name || 'Alguien'} quiere que seas su entrenador`,
-      relatedUserId: new mongoose.Types.ObjectId(String(athleteId)),
+      title: asCoach ? 'Te quieren entrenar' : 'Te piden ser entrenador',
+      message: asCoach
+        ? `${fromName || 'Alguien'} quiere ser tu entrenador`
+        : `${fromName || 'Alguien'} quiere que seas su entrenador`,
+      relatedUserId: new mongoose.Types.ObjectId(me),
     }).catch(() => {});
 
     res.status(201).json({ status: 'pending' });
@@ -1029,21 +1050,50 @@ router.post('/coach-requests', authenticateToken, async (req: Request, res: Resp
 router.get('/coach-requests', authenticateToken, async (req: Request, res: Response) => {
   try {
     const userId = (req as any).user.userId;
-    const rows = await CoachRequest.find({ coach: userId, status: 'pending' })
-      .sort({ createdAt: -1 })
-      .populate('athlete', 'name avatar')
-      .lean();
+    const [asCoach, invitedMe] = await Promise.all([
+      CoachRequest.find({
+        coach: userId,
+        status: 'pending',
+        $or: [{ initiatedBy: 'athlete' }, { initiatedBy: { $exists: false } }],
+      })
+        .sort({ createdAt: -1 })
+        .populate('athlete', 'name avatar')
+        .lean(),
+      CoachRequest.find({
+        athlete: userId,
+        status: 'pending',
+        initiatedBy: 'coach',
+      })
+        .sort({ createdAt: -1 })
+        .populate('coach', 'name avatar')
+        .lean(),
+    ]);
+
+    const fromAthlete = asCoach.map((r: any) => ({
+      id: String(r._id),
+      createdAt: r.createdAt,
+      kind: 'they_want_me_coach' as const,
+      person: {
+        id: String(r.athlete?._id ?? r.athlete),
+        name: r.athlete?.name || 'Usuario',
+        avatar: r.athlete?.avatar || null,
+      },
+    }));
+    const fromCoach = invitedMe.map((r: any) => ({
+      id: String(r._id),
+      createdAt: r.createdAt,
+      kind: 'they_want_to_coach_me' as const,
+      person: {
+        id: String(r.coach?._id ?? r.coach),
+        name: r.coach?.name || 'Usuario',
+        avatar: r.coach?.avatar || null,
+      },
+    }));
 
     res.json({
-      requests: rows.map((r: any) => ({
-        id: String(r._id),
-        createdAt: r.createdAt,
-        athlete: {
-          id: String(r.athlete?._id ?? r.athlete),
-          name: r.athlete?.name || 'Usuario',
-          avatar: r.athlete?.avatar || null,
-        },
-      })),
+      requests: [...fromAthlete, ...fromCoach].sort(
+        (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+      ),
     });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
@@ -1052,33 +1102,42 @@ router.get('/coach-requests', authenticateToken, async (req: Request, res: Respo
 
 router.put('/coach-requests/:id/:decision', authenticateToken, async (req: Request, res: Response) => {
   try {
-    const userId = (req as any).user.userId;
+    const userId = String((req as any).user.userId);
     const decision = req.params.decision === 'accept' ? 'accepted' : 'rejected';
-    const request = await CoachRequest.findOne({ _id: req.params.id, coach: userId, status: 'pending' });
+    const request = await CoachRequest.findOne({ _id: req.params.id, status: 'pending' });
     if (!request) return res.status(404).json({ error: 'Solicitud no encontrada' });
+
+    const startedBy = request.initiatedBy || 'athlete';
+    const iAmCoach = String(request.coach) === userId;
+    const iAmAthlete = String(request.athlete) === userId;
+    const canDecide = (startedBy === 'athlete' && iAmCoach) || (startedBy === 'coach' && iAmAthlete);
+    if (!canDecide) return res.status(404).json({ error: 'Solicitud no encontrada' });
 
     request.status = decision;
     await request.save();
 
     if (decision === 'accepted') {
       const athlete = await User.findById(request.athlete).select('coachId').lean();
-      if (athlete?.coachId && String(athlete.coachId) !== String(userId)) {
+      if (athlete?.coachId && String(athlete.coachId) !== String(request.coach)) {
         request.status = 'rejected';
         await request.save();
         return res.status(400).json({ error: 'Esta persona ya tiene entrenador' });
       }
-      await User.findByIdAndUpdate(request.athlete, { coachId: userId });
+      await User.findByIdAndUpdate(request.athlete, { coachId: request.coach });
       await CoachRequest.updateMany(
         { athlete: request.athlete, _id: { $ne: request._id }, status: 'pending' },
         { $set: { status: 'rejected' } }
       );
-      const coach = await User.findById(userId).select('name').lean();
+      const meUser = await User.findById(userId).select('name').lean();
+      const otherId = iAmCoach ? request.athlete : request.coach;
       await Notification.create({
-        userId: request.athlete,
+        userId: otherId,
         type: 'coach_accepted',
         title: 'Entrenador confirmado',
-        message: `${coach?.name || 'Tu entrenador'} ha aceptado entrenarte`,
-        relatedUserId: new mongoose.Types.ObjectId(String(userId)),
+        message: iAmCoach
+          ? `${meUser?.name || 'Tu entrenador'} ha aceptado entrenarte`
+          : `${meUser?.name || 'Alguien'} te ha aceptado como entrenador`,
+        relatedUserId: new mongoose.Types.ObjectId(userId),
       }).catch(() => {});
     }
 
@@ -1098,10 +1157,26 @@ function authorCard(user: { _id: unknown; name?: string; avatar?: string | null 
   };
 }
 
-function lastPreview(text?: string | null, mediaType?: string | null) {
-  if (mediaType === 'image') return (text || '').trim() || 'Foto';
-  if (mediaType === 'video') return (text || '').trim() || 'Vídeo';
-  return text || '';
+function lastPreview(
+  text?: string | null,
+  mediaType?: string | null,
+  mediaLive?: boolean
+) {
+  if (mediaLive && mediaType === 'image') return (text || '').trim() || 'Foto';
+  if (mediaLive && mediaType === 'video') return (text || '').trim() || 'Vídeo';
+  if (mediaType && !mediaLive) return (text || '').trim() || 'Caducó';
+  const raw = (text || '').trim();
+  if (/^e2e/i.test(raw)) return 'Chat listo';
+  return raw;
+}
+
+function chatAttachmentFields(media: { mediaKey: string; mediaType: 'image' | 'video' } | null) {
+  if (!media) return { mediaKey: null as string | null, mediaType: null as 'image' | 'video' | null, mediaExpiresAt: null as Date | null };
+  return {
+    mediaKey: media.mediaKey,
+    mediaType: media.mediaType,
+    mediaExpiresAt: chatMediaExpiresAt(),
+  };
 }
 
 function serializeChatLine(
@@ -1111,16 +1186,39 @@ function serializeChatLine(
     text?: string;
     mediaKey?: string | null;
     mediaType?: string | null;
+    mediaExpiresAt?: Date | string | null;
     createdAt: Date;
+    storyReply?: {
+      postId?: string;
+      mediaKey?: string;
+      mediaType?: string;
+      caption?: string;
+    } | null;
   },
   me: string,
   author?: ReturnType<typeof authorCard>
 ) {
+  const live = isChatMediaLive(row);
+  const reply = row.storyReply;
   return {
     id: String(row._id),
     text: row.text || '',
-    mediaKey: row.mediaKey || null,
-    mediaType: row.mediaType || null,
+    storyReply: reply?.mediaKey
+      ? {
+          postId: reply.postId || '',
+          mediaKey: reply.mediaKey,
+          mediaType: (reply.mediaType === 'video' ? 'video' : 'image') as 'image' | 'video',
+          caption: reply.caption || '',
+        }
+      : null,
+    mediaKey: live ? row.mediaKey || null : null,
+    mediaType: live ? row.mediaType || null : null,
+    mediaExpiresAt: live
+      ? row.mediaExpiresAt
+        ? new Date(row.mediaExpiresAt).toISOString()
+        : chatMediaExpiresAt(row.createdAt).toISOString()
+      : null,
+    mediaExpired: !!(row.mediaKey && !live),
     createdAt: row.createdAt.toISOString(),
     mine: String(row.from) === me,
     author,
@@ -1185,8 +1283,65 @@ async function notifyChatRequest(fromId: string, toId: string, preview: string) 
   broadcastSse([fromId, toId], 'social_update');
 }
 
+/** Aviso en el corazón de Inicio cuando te escriben. Si ya hay uno sin leer del mismo chat, se actualiza. */
+async function notifyChatMessage(opts: {
+  toIds: string[];
+  fromId: string;
+  preview: string;
+  groupId?: string;
+}) {
+  const from = await User.findById(opts.fromId).select('name').lean();
+  const name = from?.name || 'Alguien';
+  const preview = (opts.preview || '').trim().slice(0, 80) || (opts.groupId ? 'Foto o vídeo en el grupo' : 'Te ha enviado un mensaje');
+  const title = opts.groupId ? `${name} en el grupo` : `${name} te ha escrito`;
+  const since = new Date(Date.now() - 10 * 60 * 1000);
+  for (const toId of opts.toIds) {
+    const recent = await Notification.findOne({
+      userId: toId,
+      type: 'chat_message',
+      relatedUserId: opts.fromId,
+      read: false,
+      createdAt: { $gte: since },
+    });
+    if (recent) {
+      recent.title = title;
+      recent.message = preview;
+      recent.relatedData = opts.groupId ? { groupId: opts.groupId, peerId: opts.fromId } : { peerId: opts.fromId };
+      await recent.save().catch(() => {});
+      continue;
+    }
+    await Notification.create({
+      userId: toId,
+      type: 'chat_message',
+      title,
+      message: preview,
+      relatedUserId: opts.fromId,
+      relatedData: opts.groupId ? { groupId: opts.groupId, peerId: opts.fromId } : { peerId: opts.fromId },
+    }).catch(() => {});
+  }
+  if (opts.toIds.length) broadcastSse(opts.toIds, 'social_update');
+}
+
 function isGroupMember(group: { members: unknown[] }, userId: string): boolean {
   return group.members.some(id => String(id) === userId);
+}
+
+async function chatHiddenAt(userId: string, kind: 'dm' | 'group', targetId: string): Promise<Date | null> {
+  if (!mongoose.isValidObjectId(targetId)) return null;
+  const row = await ChatHide.findOne({ user: userId, kind, targetId }).select('hiddenAt').lean();
+  return row?.hiddenAt ?? null;
+}
+
+async function hideChatForMe(userId: string, kind: 'dm' | 'group', targetId: string) {
+  await ChatHide.findOneAndUpdate(
+    { user: userId, kind, targetId },
+    { $set: { hiddenAt: new Date() } },
+    { upsert: true }
+  );
+}
+
+function afterHidden(hiddenAt: Date | null) {
+  return hiddenAt ? { createdAt: { $gt: hiddenAt } } : {};
 }
 
 async function pendingForGroup(groupId: string) {
@@ -1202,10 +1357,12 @@ async function inviteToGroup(opts: {
   groupName: string;
   fromId: string;
   inviteeIds: string[];
+  kind?: 'group' | 'team';
 }) {
   if (opts.inviteeIds.length === 0) return;
   const from = await User.findById(opts.fromId).select('name').lean();
   const creatorName = from?.name || 'Alguien';
+  const acceptMsg = opts.kind === 'team' ? 'Acepta para entrar al equipo' : 'Acepta para entrar al grupo';
   for (const invitee of opts.inviteeIds) {
     await ChatGroupInvite.findOneAndUpdate(
       { groupId: opts.groupId, to: invitee },
@@ -1216,13 +1373,13 @@ async function inviteToGroup(opts: {
       userId: invitee,
       type: 'group_invite',
       title: `${creatorName} te invita a «${opts.groupName}»`,
-      message: 'Acepta para entrar al grupo',
+      message: acceptMsg,
       relatedUserId: opts.fromId,
       relatedData: { groupId: String(opts.groupId) },
     }).catch(() => {});
     try {
       const { sendPushToUser } = await import('../utils/push');
-      await sendPushToUser(invitee, `${creatorName} te invita a «${opts.groupName}»`, 'Acepta para entrar al grupo', {
+      await sendPushToUser(invitee, `${creatorName} te invita a «${opts.groupName}»`, acceptMsg, {
         type: 'group_invite',
         groupId: String(opts.groupId),
       });
@@ -1243,12 +1400,19 @@ async function splitJoinAndInvite(me: string, personIds: string[]) {
   return { friends, invitees };
 }
 
-async function serializeGroupCard(group: { _id: unknown; name: string; createdBy: unknown; members: unknown[] }) {
+async function serializeGroupCard(group: {
+  _id: unknown;
+  name: string;
+  createdBy: unknown;
+  members: unknown[];
+  kind?: string;
+}) {
   const users = await User.find({ _id: { $in: group.members } }).select('name avatar').lean();
   return {
     id: String(group._id),
     name: group.name,
     createdBy: String(group.createdBy),
+    kind: group.kind === 'team' ? 'team' : 'group',
     members: users.map(authorCard),
     pending: await pendingForGroup(String(group._id)),
   };
@@ -1261,6 +1425,13 @@ router.get('/chats', authenticateToken, async (req: Request, res: Response) => {
     const meOid = new mongoose.Types.ObjectId(me);
     const meDoc = await User.findById(me).select('coachId').lean();
     const coachId = meDoc?.coachId ? String(meDoc.coachId) : null;
+    const hides = await ChatHide.find({ user: me }).select('kind targetId hiddenAt').lean();
+    const hideDm = new Map(
+      hides.filter(h => h.kind === 'dm').map(h => [String(h.targetId), h.hiddenAt])
+    );
+    const hideGroup = new Map(
+      hides.filter(h => h.kind === 'group').map(h => [String(h.targetId), h.hiddenAt])
+    );
 
     const rows = await ChatMessage.find({
       groupId: null,
@@ -1276,10 +1447,17 @@ router.get('/chats', authenticateToken, async (req: Request, res: Response) => {
       if (!row.to) continue;
       const peerId = String(row.from) === me ? String(row.to) : String(row.from);
       if (seen.has(peerId)) continue;
+      const hiddenAt = hideDm.get(peerId);
+      if (hiddenAt && row.createdAt <= hiddenAt) {
+        seen.add(peerId);
+        continue;
+      }
       seen.add(peerId);
       dmThreads.push({
         peerId,
-        lastText: lastPreview(row.text, (row as { mediaType?: string | null }).mediaType),
+        lastText: row.storyReply?.mediaKey
+          ? (row.text ? `Historia · ${row.text}` : 'Respondió a tu historia')
+          : lastPreview(row.text, row.mediaType, isChatMediaLive(row)),
         lastAt: row.createdAt.toISOString(),
         unread: 0,
       });
@@ -1296,10 +1474,26 @@ router.get('/chats', authenticateToken, async (req: Request, res: Response) => {
     const groupIds = groups.map(g => g._id);
     const [groupLast, groupUnread] = groupIds.length
       ? await Promise.all([
-          ChatMessage.aggregate<{ _id: mongoose.Types.ObjectId; text: string; mediaType?: string | null; createdAt: Date }>([
+          ChatMessage.aggregate<{
+            _id: mongoose.Types.ObjectId;
+            text: string;
+            mediaType?: string | null;
+            mediaKey?: string | null;
+            mediaExpiresAt?: Date | null;
+            createdAt: Date;
+          }>([
             { $match: { groupId: { $in: groupIds } } },
             { $sort: { createdAt: -1 } },
-            { $group: { _id: '$groupId', text: { $first: '$text' }, mediaType: { $first: '$mediaType' }, createdAt: { $first: '$createdAt' } } },
+            {
+              $group: {
+                _id: '$groupId',
+                text: { $first: '$text' },
+                mediaType: { $first: '$mediaType' },
+                mediaKey: { $first: '$mediaKey' },
+                mediaExpiresAt: { $first: '$mediaExpiresAt' },
+                createdAt: { $first: '$createdAt' },
+              },
+            },
           ]),
           ChatMessage.aggregate<{ _id: mongoose.Types.ObjectId; n: number }>([
             { $match: { groupId: { $in: groupIds }, from: { $ne: meOid }, readBy: { $nin: [meOid] } } },
@@ -1354,6 +1548,8 @@ router.get('/chats', authenticateToken, async (req: Request, res: Response) => {
     for (const req of outgoingChat) {
       const peerId = String(req.to);
       if (threads.some(t => t.kind === 'dm' && (t.peer as { id: string }).id === peerId)) continue;
+      const hiddenAt = hideDm.get(peerId);
+      if (hiddenAt && req.updatedAt <= hiddenAt) continue;
       const user = byId.get(peerId);
       if (!user) continue;
       threads.push({
@@ -1369,19 +1565,27 @@ router.get('/chats', authenticateToken, async (req: Request, res: Response) => {
 
     for (const group of groups) {
       const last = lastByGroup.get(String(group._id));
+      const lastAt = last?.createdAt ?? group.createdAt;
+      const hiddenAt = hideGroup.get(String(group._id));
+      if (hiddenAt && lastAt <= hiddenAt) continue;
       threads.push({
         kind: 'group',
         group: {
           id: String(group._id),
           name: group.name,
           createdBy: String(group.createdBy),
+          kind: group.kind === 'team' ? 'team' : 'group',
           members: group.members
             .map(id => byId.get(String(id)))
             .filter(Boolean)
             .map(u => authorCard(u!)),
           pending: await pendingForGroup(String(group._id)),
         },
-        lastText: last ? lastPreview(last.text, last.mediaType) : 'Grupo nuevo',
+        lastText: last
+          ? lastPreview(last.text, last.mediaType, isChatMediaLive(last))
+          : group.kind === 'team'
+            ? 'Equipo nuevo'
+            : 'Grupo nuevo',
         lastAt: last?.createdAt ? last.createdAt.toISOString() : group.createdAt.toISOString(),
         unread: unreadByGroup.get(String(group._id)) ?? 0,
         isCoach: false,
@@ -1404,28 +1608,30 @@ router.post('/chats/groups', authenticateToken, async (req: Request, res: Respon
   try {
     const me = String((req as any).user.userId);
     const name = String(req.body?.name || '').trim().slice(0, 40);
+    const kind = req.body?.kind === 'team' ? 'team' : 'group';
+    const noun = kind === 'team' ? 'equipo' : 'grupo';
     const rawIds: string[] = Array.isArray(req.body?.memberIds)
       ? (req.body.memberIds as unknown[]).map(id => String(id))
       : [];
-    if (!name) return res.status(400).json({ error: 'Ponle un nombre al grupo' });
+    if (!name) return res.status(400).json({ error: `Ponle un nombre al ${noun}` });
 
     const unique = [...new Set(rawIds.filter(id => id && id !== me))];
     if (unique.length < 1) return res.status(400).json({ error: 'Elige al menos a una persona' });
-    if (unique.length > 29) return res.status(400).json({ error: 'Máximo 30 personas en un grupo' });
+    if (unique.length > 29) return res.status(400).json({ error: `Máximo 30 personas en un ${noun}` });
 
     const people = await User.find({ _id: { $in: unique } }).select('_id name').lean();
     if (people.length < 1) return res.status(400).json({ error: 'No se ha encontrado a nadie' });
 
     const { friends, invitees } = await splitJoinAndInvite(me, people.map(p => String(p._id)));
     const members = [me, ...friends];
-    const group = await ChatGroup.create({ name, createdBy: me, members });
-    await inviteToGroup({ groupId: group._id, groupName: name, fromId: me, inviteeIds: invitees });
+    const group = await ChatGroup.create({ name, createdBy: me, members, kind });
+    await inviteToGroup({ groupId: group._id, groupName: name, fromId: me, inviteeIds: invitees, kind });
     const card = await serializeGroupCard(group);
 
     res.status(201).json({
       kind: 'group',
       group: card,
-      lastText: card.pending?.length ? 'Esperando a que acepten' : 'Grupo nuevo',
+      lastText: card.pending?.length ? 'Esperando a que acepten' : kind === 'team' ? 'Equipo nuevo' : 'Grupo nuevo',
       lastAt: group.createdAt.toISOString(),
       unread: 0,
       isCoach: false,
@@ -1474,7 +1680,13 @@ router.post('/chats/groups/:groupId/members', authenticateToken, async (req: Req
     if (friends.length) {
       await ChatGroup.updateOne({ _id: group._id }, { $addToSet: { members: { $each: friends } } });
     }
-    await inviteToGroup({ groupId: group._id, groupName: group.name, fromId: me, inviteeIds: invitees });
+    await inviteToGroup({
+      groupId: group._id,
+      groupName: group.name,
+      fromId: me,
+      inviteeIds: invitees,
+      kind: group.kind === 'team' ? 'team' : 'group',
+    });
     const fresh = await ChatGroup.findById(group._id);
     if (!fresh) return res.status(404).json({ error: 'Grupo no encontrado' });
     broadcastSse([...fresh.members.map(id => String(id)), ...invitees], 'social_update');
@@ -1515,11 +1727,34 @@ router.delete('/chats/groups/:groupId/members/:userId', authenticateToken, async
   }
 });
 
+router.delete('/chats/groups/:groupId', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const me = String((req as any).user.userId);
+    const groupId = String(req.params.groupId);
+    if (!mongoose.isValidObjectId(groupId)) return res.status(400).json({ error: 'Grupo inválido' });
+    const group = await ChatGroup.findById(groupId);
+    if (!group || !isGroupMember(group, me)) return res.status(404).json({ error: 'Grupo no encontrado' });
+    await hideChatForMe(me, 'group', groupId);
+    const notify = group.members.map(id => String(id));
+    await ChatGroup.updateOne({ _id: group._id }, { $pull: { members: me } });
+    const leftover = await ChatGroup.findById(group._id);
+    if (leftover && leftover.members.length === 0) {
+      await ChatGroup.deleteOne({ _id: group._id });
+      await ChatMessage.deleteMany({ groupId: group._id });
+      await ChatGroupInvite.deleteMany({ groupId: group._id });
+    }
+    broadcastSse(notify, 'social_update');
+    res.json({ ok: true });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 router.get('/chats/group-invites', authenticateToken, async (req: Request, res: Response) => {
   try {
     const me = String((req as any).user.userId);
     const rows = await ChatGroupInvite.find({ to: me, status: 'pending' }).sort({ createdAt: -1 }).lean();
-    const groups = await ChatGroup.find({ _id: { $in: rows.map(r => r.groupId) } }).select('name').lean();
+    const groups = await ChatGroup.find({ _id: { $in: rows.map(r => r.groupId) } }).select('name kind').lean();
     const froms = await User.find({ _id: { $in: rows.map(r => r.from) } }).select('name avatar').lean();
     const groupById = new Map(groups.map(g => [String(g._id), g]));
     const fromById = new Map(froms.map(u => [String(u._id), u]));
@@ -1534,6 +1769,7 @@ router.get('/chats/group-invites', authenticateToken, async (req: Request, res: 
             id: String(row._id),
             groupId: String(row.groupId),
             groupName: group.name,
+            kind: group.kind === 'team' ? 'team' : 'group',
             from: authorCard(from),
             createdAt: row.createdAt.toISOString(),
           };
@@ -1587,7 +1823,8 @@ router.get('/chats/groups/:groupId/messages', authenticateToken, async (req: Req
     const group = await ChatGroup.findById(groupId).lean();
     if (!group || !isGroupMember(group, me)) return res.status(404).json({ error: 'Grupo no encontrado' });
 
-    const rows = await ChatMessage.find({ groupId })
+    const hiddenAt = await chatHiddenAt(me, 'group', groupId);
+    const rows = await ChatMessage.find({ groupId, ...afterHidden(hiddenAt) })
       .sort({ createdAt: 1 })
       .limit(200)
       .lean();
@@ -1636,13 +1873,13 @@ router.post('/chats/groups/:groupId/messages', authenticateToken, optionalChatFi
       from: me,
       groupId,
       text,
-      mediaKey: media?.mediaKey ?? null,
-      mediaType: media?.mediaType ?? null,
+      ...chatAttachmentFields(media),
       readBy: [me],
     });
     const line = serializeChatLine(created, me, meUser ? authorCard(meUser) : { id: me, name: 'Tú', avatar: null, online: true });
     const others = group.members.map(id => String(id)).filter(id => id !== me);
     broadcastSse(others, 'chat_message', { message: { ...line, mine: false }, groupId });
+    void notifyChatMessage({ toIds: others, fromId: me, preview: text, groupId });
     res.status(201).json(line);
   } catch (error: any) {
     res.status(500).json({ error: error.message });
@@ -1717,17 +1954,38 @@ router.put('/chats/chat-requests/:id/reject', authenticateToken, async (req: Req
   }
 });
 
+router.delete('/chats/:peerId', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const me = String((req as any).user.userId);
+    const peerId = String(req.params.peerId);
+    if (!mongoose.isValidObjectId(peerId) || peerId === me) {
+      return res.status(400).json({ error: 'Chat inválido' });
+    }
+    await hideChatForMe(me, 'dm', peerId);
+    await ChatMessage.updateMany(
+      { groupId: null, from: peerId, to: me, readAt: null },
+      { $set: { readAt: new Date() } }
+    );
+    await ChatRequest.deleteOne({ from: me, to: peerId, status: 'pending' });
+    res.json({ ok: true });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 router.get('/chats/:peerId/messages', authenticateToken, async (req: Request, res: Response) => {
   try {
     const me = String((req as any).user.userId);
     const peerId = String(req.params.peerId);
     if (await canTalk(me, peerId)) {
+      const hiddenAt = await chatHiddenAt(me, 'dm', peerId);
       const rows = await ChatMessage.find({
         groupId: null,
         $or: [
           { from: me, to: peerId },
           { from: peerId, to: me },
         ],
+        ...afterHidden(hiddenAt),
       })
         .sort({ createdAt: 1 })
         .limit(200)
@@ -1812,6 +2070,7 @@ router.post('/chats/:peerId/messages', authenticateToken, optionalChatFile, asyn
     const deliver = async (created: { _id: unknown; from: unknown; text?: string; mediaKey?: string | null; mediaType?: string | null; createdAt: Date }) => {
       const line = serializeChatLine(created, me);
       broadcastSse([peerId], 'chat_message', { message: { ...line, mine: false }, peerId: me });
+      void notifyChatMessage({ toIds: [peerId], fromId: me, preview: text });
       return line;
     };
 
@@ -1820,8 +2079,7 @@ router.post('/chats/:peerId/messages', authenticateToken, optionalChatFile, asyn
         from: me,
         to: peerId,
         text,
-        mediaKey: media?.mediaKey ?? null,
-        mediaType: media?.mediaType ?? null,
+        ...chatAttachmentFields(media),
       });
       return res.status(201).json(await deliver(created));
     }
@@ -1837,8 +2095,7 @@ router.post('/chats/:peerId/messages', authenticateToken, optionalChatFile, asyn
         from: me,
         to: peerId,
         text,
-        mediaKey: media?.mediaKey ?? null,
-        mediaType: media?.mediaType ?? null,
+        ...chatAttachmentFields(media),
       });
       broadcastSse([me, peerId], 'social_update');
       return res.status(201).json(await deliver(created));
@@ -1850,8 +2107,7 @@ router.post('/chats/:peerId/messages', authenticateToken, optionalChatFile, asyn
         from: me,
         to: peerId,
         text,
-        mediaKey: media?.mediaKey ?? null,
-        mediaType: media?.mediaType ?? null,
+        ...chatAttachmentFields(media),
       });
       return res.status(201).json(await deliver(created));
     }

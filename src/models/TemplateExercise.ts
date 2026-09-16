@@ -10,14 +10,19 @@ export interface ITemplateExercise extends Document {
   pct?: number;
   pctPerSet?: number[];
   weight?: number;
+  weightPerSet?: number[];
   mode: 'weight' | 'reps' | 'seconds';
   linkedTrainingMaxId?: mongoose.Types.ObjectId;
   /** IDs de cliente (p. ej. tm-1) cuando aún no hay ObjectId de TM */
   linkedClientKey?: string;
-  /** RPE objetivo prescrito ("6", "8,5"); viene de planes importados del entrenador. */
+  /** RPE objetivo prescrito ("6", "8.5" o "8.5 · 6.5"); viene de planes importados del entrenador. */
   targetRpe?: string;
   /** Indicación del entrenador para ese ejercicio ("grabar ambas piernas"). */
   coachNote?: string;
+  /** Varios bloques del mismo movimiento: "1×2 + 3×4". */
+  setScheme?: string;
+  repsPerSet?: string[];
+  rpePerSet?: string[];
 }
 
 const TemplateExerciseSchema = new Schema<ITemplateExercise>(
@@ -31,11 +36,15 @@ const TemplateExerciseSchema = new Schema<ITemplateExercise>(
     pct: { type: Number },
     pctPerSet: [{ type: Number }],
     weight: { type: Number },
+    weightPerSet: [{ type: Number }],
     mode: { type: String, enum: ['weight', 'reps', 'seconds'], default: 'weight' },
     linkedTrainingMaxId: { type: Schema.Types.ObjectId, ref: 'TrainingMax' },
     linkedClientKey: { type: String, trim: true, maxlength: 128 },
-    targetRpe: { type: String, trim: true, maxlength: 8 },
+    targetRpe: { type: String, trim: true, maxlength: 64 },
     coachNote: { type: String, trim: true, maxlength: 300 },
+    setScheme: { type: String, trim: true, maxlength: 200 },
+    repsPerSet: [{ type: String, trim: true, maxlength: 16 }],
+    rpePerSet: [{ type: String, trim: true, maxlength: 8 }],
   },
   { timestamps: false }
 );

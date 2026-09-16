@@ -1,5 +1,7 @@
 import { Post } from '../models/Post';
 import { PostComment } from '../models/PostComment';
+import { ChatMessage } from '../models/ChatMessage';
+import { CHAT_MEDIA_LIFETIME_MS } from './chatMedia';
 import { mediaStorage } from './mediaStorage';
 import { logger } from './logger';
 
@@ -47,10 +49,50 @@ export async function sweepExpiredStories(): Promise<number> {
   return expired.length;
 }
 
+/** Quita del disco las fotos/vídeos de chat que ya han cumplido 24 h; el texto se queda. */
+export async function sweepExpiredChatMedia(): Promise<number> {
+  const now = new Date();
+  const legacyCutoff = new Date(now.getTime() - CHAT_MEDIA_LIFETIME_MS);
+  const expired = await ChatMessage.find({
+    mediaKey: { $nin: [null, ''] },
+    $or: [
+      { mediaExpiresAt: { $lte: now } },
+      {
+        $and: [
+          { $or: [{ mediaExpiresAt: null }, { mediaExpiresAt: { $exists: false } }] },
+          { createdAt: { $lte: legacyCutoff } },
+        ],
+      },
+    ],
+  })
+    .select('_id mediaKey')
+    .limit(BATCH)
+    .lean();
+  if (expired.length === 0) return 0;
+
+  const storage = mediaStorage();
+  await Promise.all(
+    expired.map(m =>
+      m.mediaKey
+        ? storage.remove(m.mediaKey).catch(e => logger.warn(`No se pudo borrar el medio de chat ${m.mediaKey}`, e))
+        : Promise.resolve()
+    )
+  );
+
+  await ChatMessage.updateMany(
+    { _id: { $in: expired.map(m => m._id) } },
+    { $set: { mediaKey: null, mediaType: null, mediaExpiresAt: null } }
+  );
+
+  logger.info(`[chat] ${expired.length} fotos/vídeos caducados borrados`);
+  return expired.length;
+}
+
 /** Arranca la limpieza periódica; devuelve el temporizador por si hace falta pararlo. */
 export function startStoryCleanup(): NodeJS.Timeout {
   const run = () => {
     void sweepExpiredStories().catch(e => logger.warn('[historias] barrida fallida', e));
+    void sweepExpiredChatMedia().catch(e => logger.warn('[chat] barrida de medios fallida', e));
   };
   run();
   const timer = setInterval(run, SWEEP_INTERVAL_MS);

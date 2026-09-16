@@ -576,6 +576,9 @@ router.post(
       }
 
       const { token, name, bodyWeight, password, gender } = req.body;
+      const rawAvatar = typeof req.body.avatar === 'string' ? req.body.avatar.trim() : '';
+      const avatar =
+        rawAvatar.startsWith('data:image/') && rawAvatar.length <= 700_000 ? rawAvatar : '';
 
       const pending = await PendingSignup.findOne({
         verificationToken: token,
@@ -617,7 +620,7 @@ router.post(
         password: hashedPassword,
         gender,
         emailVerified: true,
-        avatar: '',
+        avatar,
       });
 
       const validationError = user.validateSync();

@@ -5,6 +5,7 @@
 import { Challenge } from './Challenge';
 import { ChatGroup } from './ChatGroup';
 import { ChatGroupInvite } from './ChatGroupInvite';
+import { ChatHide } from './ChatHide';
 import { ChatMessage } from './ChatMessage';
 import { ChatRequest } from './ChatRequest';
 import { CoachRequest } from './CoachRequest';
@@ -55,6 +56,7 @@ const REGISTERED_MODELS = [
   ChatMessage,
   ChatGroup,
   ChatGroupInvite,
+  ChatHide,
   ChatRequest,
 ] as const;
 

@@ -69,6 +69,16 @@ export const config = {
   mobileAppScheme: process.env.MOBILE_APP_SCHEME || 'powerliftingtracker',
 };
 
+/** Preview/producción en Vercel: el origen cambia en cada deploy. */
+export function isAllowedVercelOrigin(origin: string): boolean {
+  try {
+    const u = new URL(origin);
+    return u.protocol === 'https:' && (u.hostname === 'vercel.app' || u.hostname.endsWith('.vercel.app'));
+  } catch {
+    return false;
+  }
+}
+
 /** Orígenes permitidos para CORS. En producción no se incluye localhost salvo ALLOW_LOCALHOST_CORS=true. */
 export function getCorsAllowedOrigins(): string[] {
   const list: string[] = [];

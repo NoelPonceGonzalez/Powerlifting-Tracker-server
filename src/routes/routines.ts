@@ -173,6 +173,11 @@ router.patch('/:id/plan', authenticateToken, async (req: Request, res: Response)
     if (Array.isArray(req.body.shiftedAtCalendarWeeks)) {
       (routine as any).shiftedAtCalendarWeeks = req.body.shiftedAtCalendarWeeks.filter((w: any) => Number.isFinite(w));
     }
+    if (Array.isArray(req.body.calendarDayShifts)) {
+      (routine as any).calendarDayShifts = req.body.calendarDayShifts.filter(
+        (s: any) => s && Number.isFinite(s.year) && Number.isFinite(s.week) && Array.isArray(s.skippedDays)
+      );
+    }
     await routine.save();
 
     const rid = oid(routine._id);
@@ -255,7 +260,7 @@ router.patch('/:id/exercises/:exId', authenticateToken, async (req: Request, res
     const te = await TemplateExercise.findById(req.params.exId);
     if (!te) return res.status(404).json({ error: 'Ejercicio no encontrado' });
 
-    const { name, sets, reps, pct, pctPerSet, weight, mode, linkedTo } = req.body;
+    const { name, sets, reps, pct, pctPerSet, weight, weightPerSet, mode, linkedTo, targetRpe, coachNote, setScheme, repsPerSet, rpePerSet } = req.body;
     const $set: Record<string, any> = {};
     if (name !== undefined) $set.exerciseName = name;
     if (sets !== undefined) $set.sets = sets;
@@ -266,12 +271,18 @@ router.patch('/:id/exercises/:exId', authenticateToken, async (req: Request, res
     if (pct !== undefined) $set.pct = pct;
     if (pctPerSet !== undefined) $set.pctPerSet = pctPerSet;
     if (weight !== undefined) $set.weight = weight;
+    if (weightPerSet !== undefined) $set.weightPerSet = weightPerSet;
     if (mode !== undefined) $set.mode = mode;
     if (linkedTo !== undefined) {
       const tmOid = safeLinkedTrainingMaxId(linkedTo);
       $set.linkedTrainingMaxId = tmOid || undefined;
       $set.linkedClientKey = tmOid ? undefined : (linkedTo || undefined);
     }
+    if (targetRpe !== undefined) $set.targetRpe = targetRpe;
+    if (coachNote !== undefined) $set.coachNote = coachNote;
+    if (setScheme !== undefined) $set.setScheme = setScheme;
+    if (repsPerSet !== undefined) $set.repsPerSet = repsPerSet;
+    if (rpePerSet !== undefined) $set.rpePerSet = rpePerSet;
 
     if (Object.keys($set).length === 0) return res.json({ ok: true, updated: 0 });
 
@@ -287,6 +298,7 @@ router.patch('/:id/exercises/:exId', authenticateToken, async (req: Request, res
           ...(fresh.pct != null ? { pct: fresh.pct } : {}),
           ...(fresh.pctPerSet?.length ? { pctPerSet: fresh.pctPerSet } : {}),
           ...(fresh.weight != null ? { weight: fresh.weight } : {}),
+          ...(fresh.weightPerSet?.some((w) => w > 0) ? { weightPerSet: fresh.weightPerSet } : {}),
           mode: fresh.mode,
         }
       : undefined;
@@ -530,6 +542,11 @@ router.put(
       }
       if (Array.isArray(req.body.shiftedAtCalendarWeeks)) {
         (routine as any).shiftedAtCalendarWeeks = req.body.shiftedAtCalendarWeeks.filter((w: any) => Number.isFinite(w));
+      }
+      if (Array.isArray(req.body.calendarDayShifts)) {
+        (routine as any).calendarDayShifts = req.body.calendarDayShifts.filter(
+          (s: any) => s && Number.isFinite(s.year) && Number.isFinite(s.week) && Array.isArray(s.skippedDays)
+        );
       }
       if (req.body.progressCheckpointAt !== undefined) {
         const raw = req.body.progressCheckpointAt;

@@ -85,6 +85,7 @@ export async function assembleRoutinePlan(routineId: mongoose.Types.ObjectId) {
       ...(te.pct != null ? { pct: te.pct } : {}),
       ...(te.pctPerSet?.length ? { pctPerSet: te.pctPerSet } : {}),
       ...(te.weight != null ? { weight: te.weight } : {}),
+      ...(te.weightPerSet?.some((w: number) => w > 0) ? { weightPerSet: te.weightPerSet } : {}),
       mode: te.mode,
       ...(te.linkedTrainingMaxId
         ? { linkedTo: String(te.linkedTrainingMaxId) }
@@ -93,6 +94,9 @@ export async function assembleRoutinePlan(routineId: mongoose.Types.ObjectId) {
           : {}),
       ...(te.targetRpe ? { targetRpe: te.targetRpe } : {}),
       ...(te.coachNote ? { coachNote: te.coachNote } : {}),
+      ...(te.setScheme ? { setScheme: te.setScheme } : {}),
+      ...(te.repsPerSet?.length ? { repsPerSet: te.repsPerSet } : {}),
+      ...(te.rpePerSet?.length ? { rpePerSet: te.rpePerSet } : {}),
     };
   }
 
@@ -388,11 +392,15 @@ export async function disassemblePlanToCollections(input: DisassemblePlanInput) 
             pct: ex.pct,
             pctPerSet: Array.isArray(ex.pctPerSet) ? ex.pctPerSet : undefined,
             weight: ex.weight,
+            weightPerSet: Array.isArray(ex.weightPerSet) ? ex.weightPerSet : undefined,
             mode: ex.mode || 'weight',
             linkedTrainingMaxId: safeLinkedTrainingMaxId(ex),
             linkedClientKey: linkedClientKeyFromExercise(ex),
             targetRpe: ex.targetRpe || undefined,
             coachNote: ex.coachNote || undefined,
+            setScheme: ex.setScheme || undefined,
+            repsPerSet: Array.isArray(ex.repsPerSet) ? ex.repsPerSet : undefined,
+            rpePerSet: Array.isArray(ex.rpePerSet) ? ex.rpePerSet : undefined,
           });
         }
       }
