@@ -1,7 +1,7 @@
 import mongoose from 'mongoose';
 import { Routine } from '../models/Routine';
-import { ExerciseLog } from '../models/ExerciseLog';
 import { logger } from './logger';
+
 function getLatestVersionWeeks(routine: any): any[] | null {
   const versions = routine.versions;
   if (Array.isArray(versions) && versions.length > 0) {
@@ -13,79 +13,6 @@ function getLatestVersionWeeks(routine: any): any[] | null {
     }
   }
   return null;
-}
-
-const CHUNK = 500;
-
-/**
- * Migra `logs` embebidos en Routine → colección ExerciseLog y elimina el mapa embebido.
- * Idempotente: upsert por (routineId, logKey).
- */
-export async function migrateRoutineEmbeddedLogsToExerciseLogs(): Promise<void> {
-  let migrated = 0;
-  const routines = await Routine.find({}).lean();
-  for (const r of routines) {
-    const raw = (r as any).logs;
-    if (raw == null) continue;
-    const entries =
-      raw instanceof Map
-        ? [...raw.entries()]
-        : typeof raw === 'object' && !Array.isArray(raw)
-          ? Object.entries(raw as Record<string, unknown>)
-          : [];
-    if (entries.length === 0) continue;
-
-    const rid =
-      r._id instanceof mongoose.Types.ObjectId ? r._id : new mongoose.Types.ObjectId(String(r._id));
-    const uid =
-      r.userId instanceof mongoose.Types.ObjectId
-        ? r.userId
-        : new mongoose.Types.ObjectId(String(r.userId));
-
-    const ops: any[] = [];
-    for (const [logKey, v] of entries) {
-      if (!v || typeof v !== 'object' || Array.isArray(v)) continue;
-      const val = v as Record<string, any>;
-      const sets = Array.isArray(val.sets)
-        ? val.sets.map((s: any) => ({
-            id: s?.id != null ? String(s.id) : '0',
-            reps: s?.reps != null && s.reps !== '' ? s.reps : null,
-            weight: s?.weight != null && s.weight !== '' ? s.weight : null,
-            completed: !!s?.completed,
-            ...(s?.inputMode === 'kg' || s?.inputMode === 'pct' ? { inputMode: s.inputMode } : {}),
-            ...(typeof s?.mediaKey === 'string' && s.mediaKey
-              ? { mediaKey: s.mediaKey, mediaType: s.mediaType === 'image' ? 'image' : 'video' }
-              : {}),
-          }))
-        : [];
-      ops.push({
-        updateOne: {
-          filter: { routineId: rid, logKey: String(logKey) },
-          update: {
-            $set: {
-              userId: uid,
-              routineId: rid,
-              logKey: String(logKey),
-              rpe: val.rpe != null ? String(val.rpe) : '',
-              notes: val.notes != null ? String(val.notes) : '',
-              completed: !!val.completed,
-              ...(val.weight != null && Number.isFinite(Number(val.weight)) ? { weight: Number(val.weight) } : {}),
-              sets,
-            },
-          },
-          upsert: true,
-        },
-      });
-    }
-    for (let i = 0; i < ops.length; i += CHUNK) {
-      await ExerciseLog.bulkWrite(ops.slice(i, i + CHUNK));
-    }
-    await Routine.collection.updateOne({ _id: rid }, { $unset: { logs: 1 } });
-    migrated += 1;
-  }
-  if (migrated > 0) {
-    logger.info(`[migration] ExerciseLog: migrados logs embebidos en ${migrated} rutina(s)`);
-  }
 }
 
 /**

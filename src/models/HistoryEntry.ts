@@ -19,8 +19,6 @@ export interface IHistoryEntry extends Document {
   benchRm?: number;
   squatRm?: number;
   deadliftRm?: number;
-  /** @deprecated migrar a HistoryTmSnapshot */
-  trainingMaxes?: Record<string, number>;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -49,7 +47,6 @@ const HistoryEntrySchema = new Schema<IHistoryEntry>(
     benchRm: { type: Number },
     squatRm: { type: Number },
     deadliftRm: { type: Number },
-    trainingMaxes: { type: Schema.Types.Mixed },
   },
   { timestamps: true }
 );

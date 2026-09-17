@@ -19,14 +19,6 @@ function normalizeName(s: string): string {
 
 type InternalMode = 'weight' | 'reps' | 'seconds';
 
-/** Copia `value` legado a valueWeight si hace falta. */
-function migrateLegacyFields(doc: any): void {
-  const legacy = doc.value;
-  if (legacy != null && doc.valueWeight == null) {
-    doc.valueWeight = legacy;
-  }
-}
-
 async function assertRoutineOwned(userId: mongoose.Types.ObjectId, routineId: string) {
   return Routine.findOne({ _id: routineId, userId });
 }
@@ -72,13 +64,6 @@ router.get(
           : new mongoose.Types.ObjectId(String(routine._id));
 
       const rows = await InternalExerciseMax.find({ userId, routineId: rid }).sort({ name: 1 });
-      for (const doc of rows) {
-        const any = doc as any;
-        if (any.value != null && any.valueWeight == null) {
-          any.valueWeight = any.value;
-          await doc.save();
-        }
-      }
       res.json(rows);
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -127,14 +112,10 @@ router.post(
 
       const existing = await InternalExerciseMax.findOne({ userId, routineId: rid, nameNormalized });
       if (existing) {
-        migrateLegacyFields(existing);
         const field =
           mode === 'weight' ? 'valueWeight' : mode === 'reps' ? 'valueReps' : 'valueSeconds';
         const ex = existing as any;
-        const prev =
-          field === 'valueWeight'
-            ? ex.valueWeight ?? ex.value ?? 0
-            : ex[field] ?? 0;
+        const prev = ex[field] ?? 0;
         if (overwrite || candidateValue > prev) {
           ex[field] = candidateValue;
         }
@@ -183,16 +164,14 @@ router.put(
           ? routine._id
           : new mongoose.Types.ObjectId(String(routine._id));
 
-      const { valueWeight, valueReps, valueSeconds, value } = req.body;
+      const { valueWeight, valueReps, valueSeconds } = req.body;
       const doc = await InternalExerciseMax.findOne({ _id: req.params.id, userId, routineId: rid });
       if (!doc) {
         return res.status(404).json({ error: 'No encontrado en esta rutina' });
       }
-      migrateLegacyFields(doc);
       if (valueWeight !== undefined) (doc as any).valueWeight = Number(valueWeight);
       if (valueReps !== undefined) (doc as any).valueReps = Number(valueReps);
       if (valueSeconds !== undefined) (doc as any).valueSeconds = Number(valueSeconds);
-      if (value !== undefined) (doc as any).value = Number(value);
       await doc.save();
       res.json(doc);
     } catch (error: any) {

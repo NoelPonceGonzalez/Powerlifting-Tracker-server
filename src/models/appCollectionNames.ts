@@ -9,7 +9,6 @@ import { ChatHide } from './ChatHide';
 import { ChatMessage } from './ChatMessage';
 import { ChatRequest } from './ChatRequest';
 import { CoachRequest } from './CoachRequest';
-import { ExerciseLog } from './ExerciseLog';
 import { Friendship } from './Friendship';
 import { Post } from './Post';
 import { PostComment } from './PostComment';
@@ -44,7 +43,6 @@ const REGISTERED_MODELS = [
   WorkoutSession,
   WorkoutExercise,
   WorkoutSet,
-  ExerciseLog,
   Notification,
   InternalExerciseMax,
   GymCheckIn,

@@ -14,8 +14,6 @@ export interface IInternalExerciseMax extends Document {
   valueReps?: number;
   /** Mejor tiempo (segundos) — modo segundos. */
   valueSeconds?: number;
-  /** @deprecated Usar valueWeight; se migra automáticamente desde documentos antiguos. */
-  value?: number;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -48,8 +46,6 @@ const InternalExerciseMaxSchema = new Schema<IInternalExerciseMax>(
     valueWeight: { type: Number },
     valueReps: { type: Number },
     valueSeconds: { type: Number },
-    /** Legado: un solo valor; se copia a valueWeight al leer/actualizar. */
-    value: { type: Number },
   },
   {
     timestamps: true,

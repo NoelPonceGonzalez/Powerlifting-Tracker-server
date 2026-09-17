@@ -4,10 +4,7 @@ import { TrainingMax } from '../models/TrainingMax';
 import { HistoryEntry } from '../models/HistoryEntry';
 import { InternalExerciseMax } from '../models/InternalExerciseMax';
 import { logger } from './logger';
-import {
-  migrateRoutineEmbeddedLogsToExerciseLogs,
-  migrateUnsetRoutineTopLevelWeeks,
-} from './migrateExerciseLogs';
+import { migrateUnsetRoutineTopLevelWeeks } from './migrateExerciseLogs';
 import { runNormalizedMigration } from './migrateToNormalized';
 
 /**
@@ -20,7 +17,6 @@ export async function runRoutineMongoMigrations(): Promise<void> {
     await migrateOrphanInternalExerciseMaxes();
     await migrateOrphanHistoryEntries();
     await normalizeActiveRoutineFlags();
-    await migrateRoutineEmbeddedLogsToExerciseLogs();
     await migrateUnsetRoutineTopLevelWeeks();
     await runNormalizedMigration();
   } catch (e: unknown) {

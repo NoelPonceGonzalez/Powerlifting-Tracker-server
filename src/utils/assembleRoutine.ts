@@ -12,7 +12,6 @@ import { WorkoutExercise } from '../models/WorkoutExercise';
 import { WorkoutSet } from '../models/WorkoutSet';
 import { HistoryTmSnapshot } from '../models/HistoryTmSnapshot';
 import { InternalExerciseMax } from '../models/InternalExerciseMax';
-import { ExerciseLog } from '../models/ExerciseLog';
 import { Routine } from '../models/Routine';
 
 const oid = (v: any) =>
@@ -639,7 +638,7 @@ export async function getExpectedExerciseCountForSession(
 }
 
 /**
- * Elimina WorkoutExercise/WorkoutSet y ExerciseLog cuyo índice de ejercicio ya no existe en la plantilla nueva.
+ * Elimina WorkoutExercise/WorkoutSet cuyo índice de ejercicio ya no existe en la plantilla nueva.
  * Debe llamarse después de `disassemblePlanToCollections` (p. ej. PATCH /plan).
  */
 export async function pruneWorkoutDataAfterPlanChange(routineId: mongoose.Types.ObjectId): Promise<void> {
@@ -660,21 +659,6 @@ export async function pruneWorkoutDataAfterPlanChange(routineId: mongoose.Types.
     const ids = toRemove.map((w) => oid(w._id));
     await WorkoutSet.deleteMany({ workoutExerciseId: { $in: ids } });
     await WorkoutExercise.deleteMany({ _id: { $in: ids } });
-  }
-
-  const logDocs = await ExerciseLog.find({ routineId }).select('_id logKey').lean();
-  for (const doc of logDocs) {
-    const parsed = parseLogKeyForDisassembly(doc.logKey);
-    if (!parsed) continue;
-    const exp = await getExpectedExerciseCountForSession(
-      routineId,
-      parsed.planWeek,
-      parsed.planDayIndex,
-      cycleLength
-    );
-    if (parsed.exerciseIndex > exp) {
-      await ExerciseLog.deleteOne({ _id: doc._id });
-    }
   }
 }
 
@@ -701,5 +685,4 @@ export async function deleteRoutineCascade(routineId: mongoose.Types.ObjectId) {
     await WorkoutSession.deleteMany({ routineId });
   }
   await InternalExerciseMax.deleteMany({ routineId });
-  await ExerciseLog.deleteMany({ routineId });
 }

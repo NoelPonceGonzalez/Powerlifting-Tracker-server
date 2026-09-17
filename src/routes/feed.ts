@@ -73,18 +73,19 @@ function serializePost(post: any, viewerId: string) {
     mediaKey: post.mediaKey,
     caption: post.caption ?? '',
     likeCount: likes.length,
-    likedByMe: likes.some((l: any) => String(l) === String(viewerId)),
+    likedByMe: likes.some((l: any) => String(l?._id ?? l) === String(viewerId)),
     viewedByMe: views.some((v: any) => String(v?._id ?? v) === String(viewerId)),
     commentCount: post.commentCount ?? 0,
     createdAt: post.createdAt,
     expiresAt: post.expiresAt ?? null,
     author: authorOf(post.userId),
     mine,
-    // Quién ha visto la historia solo se le enseña a su autor.
+    // Quién ha visto o dado like solo se le enseña a su autor.
     ...(mine && post.kind === 'story'
       ? {
           viewCount: views.length,
           viewers: views.filter((v: any) => v?.name).map(authorOf),
+          likers: likes.filter((l: any) => l?.name).map(authorOf),
         }
       : {}),
   };
@@ -166,6 +167,7 @@ router.get('/stories', authenticateToken, async (req: Request, res: Response) =>
       .sort({ createdAt: 1 })
       .populate('userId', 'name avatar')
       .populate('views', 'name avatar')
+      .populate('likes', 'name avatar')
       .lean();
 
     const byAuthor = new Map<string, { author: ReturnType<typeof authorOf>; items: any[] }>();

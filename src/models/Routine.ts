@@ -87,7 +87,6 @@ const RoutineSchema = new Schema<IRoutine>(
   },
   {
     timestamps: true,
-    strict: false, // allow legacy fields (weeks, logs, versions…) until fully migrated
   }
 );
 

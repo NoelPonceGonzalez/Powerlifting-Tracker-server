@@ -6,8 +6,88 @@ import { Friendship } from '../models/Friendship';
 import { body, validationResult } from 'express-validator';
 import { sendPushToUser } from '../utils/push';
 import { broadcastSse } from '../utils/sse';
+import { getVapidPublicKey, isWebPushConfigured } from '../utils/webPush';
 
 const router = express.Router();
+
+function isPushSub(body: any): body is { endpoint: string; keys: { p256dh: string; auth: string } } {
+  return (
+    !!body &&
+    typeof body.endpoint === 'string' &&
+    body.endpoint.startsWith('https://') &&
+    typeof body.keys?.p256dh === 'string' &&
+    typeof body.keys?.auth === 'string'
+  );
+}
+
+// GET /api/notifications/vapid-public-key — clave pública para suscribir el navegador
+router.get('/vapid-public-key', (_req: Request, res: Response) => {
+  res.json({
+    publicKey: getVapidPublicKey(),
+    configured: isWebPushConfigured(),
+  });
+});
+
+// POST /api/notifications/web-push-subscription — guardar suscripción PWA
+router.post('/web-push-subscription', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthRequest).userId || (req as any).user?.userId;
+    if (!userId) return res.status(401).json({ error: 'Usuario no autenticado' });
+    if (!isPushSub(req.body)) {
+      return res.status(400).json({ error: 'Suscripción Web Push no válida' });
+    }
+    const user = await User.findById(userId).select('webPushSubscriptions');
+    if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
+
+    const next = [
+      ...(user.webPushSubscriptions || []).filter((s) => s.endpoint !== req.body.endpoint),
+      {
+        endpoint: req.body.endpoint,
+        keys: { p256dh: req.body.keys.p256dh, auth: req.body.keys.auth },
+        createdAt: new Date(),
+      },
+    ].slice(-8);
+
+    await User.findByIdAndUpdate(userId, { webPushSubscriptions: next });
+    res.json({ message: 'Suscripción registrada' });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// DELETE /api/notifications/web-push-subscription — quitar este navegador
+router.delete('/web-push-subscription', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthRequest).userId || (req as any).user?.userId;
+    if (!userId) return res.status(401).json({ error: 'Usuario no autenticado' });
+    const endpoint =
+      (typeof req.body?.endpoint === 'string' && req.body.endpoint.trim()) ||
+      (typeof req.query.endpoint === 'string' && String(req.query.endpoint).trim()) ||
+      '';
+    if (!endpoint) return res.status(400).json({ error: 'endpoint requerido' });
+    await User.findByIdAndUpdate(userId, { $pull: { webPushSubscriptions: { endpoint } } });
+    res.json({ message: 'Suscripción eliminada' });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// POST /api/notifications/test-push — aviso real a este usuario (Expo + Web Push)
+router.post('/test-push', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthRequest).userId || (req as any).user?.userId;
+    if (!userId) return res.status(401).json({ error: 'Usuario no autenticado' });
+    await sendPushToUser(
+      String(userId),
+      'Powerlifting Tracker',
+      'Aviso de prueba. Si lo ves, los avisos llegan aunque la app esté cerrada.',
+      { type: '' }
+    );
+    res.json({ message: 'Aviso enviado' });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
 // PUT /api/notifications/push-token - Registrar token de push (Expo)
 router.put(
@@ -23,16 +103,16 @@ router.put(
       const userId = (req as AuthRequest).userId || (req as any).user?.userId;
       if (!userId) return res.status(401).json({ error: 'Usuario no autenticado' });
       const token = String(req.body.token).trim();
-      const user = await User.findById(userId).select('pushToken pushTokens');
+      const user = await User.findById(userId).select('pushTokens');
       if (!user) return res.status(404).json({ error: 'Usuario no encontrado' });
       const merged = [
         ...new Set(
-          [...(user.pushTokens || []), user.pushToken, token].filter(
+          [...(user.pushTokens || []), token].filter(
             (x): x is string => typeof x === 'string' && x.length > 0
           )
         ),
       ];
-      await User.findByIdAndUpdate(userId, { pushTokens: merged, $unset: { pushToken: '' } });
+      await User.findByIdAndUpdate(userId, { pushTokens: merged });
       res.json({ message: 'Token registrado' });
     } catch (error: any) {
       res.status(500).json({ error: error.message });

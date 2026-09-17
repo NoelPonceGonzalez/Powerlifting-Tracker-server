@@ -17,14 +17,16 @@ export interface IUser extends Document {
   mbMode?: boolean;
   progressMode?: 'month' | 'year';
   emailVerified: boolean;
-  verificationToken?: string;
-  verificationTokenExpires?: Date;
   resetPasswordToken?: string;
   resetPasswordExpires?: Date;
-  /** @deprecated Usar pushTokens; se mantiene por migración desde clientes antiguos. */
-  pushToken?: string;
   /** Tokens Expo por dispositivo (varios móviles/tablets por cuenta). */
   pushTokens?: string[];
+  /** Suscripciones Web Push (PWA / Chrome / Safari instalado). */
+  webPushSubscriptions?: {
+    endpoint: string;
+    keys?: { p256dh?: string; auth?: string } | null;
+    createdAt?: Date;
+  }[];
   createdAt: Date;
   updatedAt: Date;
 }
@@ -94,24 +96,27 @@ const UserSchema = new Schema<IUser>(
       type: Boolean,
       default: false,
     },
-    verificationToken: {
-      type: String,
-    },
-    verificationTokenExpires: {
-      type: Date,
-    },
     resetPasswordToken: {
       type: String,
     },
     resetPasswordExpires: {
       type: Date,
     },
-    pushToken: {
-      type: String,
-      default: null,
-    },
     pushTokens: {
       type: [String],
+      default: [],
+    },
+    webPushSubscriptions: {
+      type: [
+        {
+          endpoint: { type: String, required: true },
+          keys: {
+            p256dh: { type: String, required: true },
+            auth: { type: String, required: true },
+          },
+          createdAt: { type: Date, default: Date.now },
+        },
+      ],
       default: [],
     },
   },
@@ -121,7 +126,6 @@ const UserSchema = new Schema<IUser>(
 );
 
 // Índices para mejorar búsquedas
-UserSchema.index({ verificationToken: 1 });
 UserSchema.index({ resetPasswordToken: 1 });
 
 export const User = mongoose.model<IUser>('User', UserSchema);

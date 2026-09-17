@@ -473,7 +473,7 @@ router.get(
 
       const enriched = history.map((h: any) => ({
         ...h,
-        trainingMaxes: snapByEntry.get(String(h._id)) || h.trainingMaxes || {},
+        trainingMaxes: snapByEntry.get(String(h._id)) || {},
         rms: {
           bench: h.benchRm ?? 0,
           squat: h.squatRm ?? 0,

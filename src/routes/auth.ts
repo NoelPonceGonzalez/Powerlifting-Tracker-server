@@ -859,7 +859,7 @@ router.post(
 // 5. Obtener usuario actual
 router.get('/me', authenticateToken, async (req: AuthRequest, res: Response) => {
   try {
-    const user = await User.findById(req.userId).select('-password -verificationToken -resetPasswordToken');
+    const user = await User.findById(req.userId).select('-password -resetPasswordToken');
     if (!user) {
       return res.status(404).json({ error: 'Usuario no encontrado' });
     }
@@ -893,16 +893,16 @@ router.post('/logout', authenticateToken, async (req: Request, res: Response) =>
     if (userId) {
       const bodyToken =
         typeof req.body?.token === 'string' ? req.body.token.trim() : '';
-      if (bodyToken) {
-        const u = await User.findById(userId).select('pushToken pushTokens');
-        if (u) {
-          await User.findByIdAndUpdate(userId, { $pull: { pushTokens: bodyToken } });
-          if (u.pushToken === bodyToken) {
-            await User.findByIdAndUpdate(userId, { $unset: { pushToken: '' } });
-          }
-        }
-      } else {
-        await User.findByIdAndUpdate(userId, { $set: { pushTokens: [] }, $unset: { pushToken: '' } });
+      const webPushEndpoint =
+        typeof req.body?.webPushEndpoint === 'string' ? req.body.webPushEndpoint.trim() : '';
+      const update: Record<string, unknown> = {};
+      const pull: Record<string, unknown> = {};
+      if (bodyToken) pull.pushTokens = bodyToken;
+      else update.$set = { pushTokens: [] };
+      if (webPushEndpoint) pull.webPushSubscriptions = { endpoint: webPushEndpoint };
+      if (Object.keys(pull).length > 0) update.$pull = pull;
+      if (Object.keys(update).length > 0) {
+        await User.findByIdAndUpdate(userId, update);
       }
     }
   } catch {

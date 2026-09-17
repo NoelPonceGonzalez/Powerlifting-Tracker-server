@@ -13,7 +13,7 @@ import {
   type ChallengeScoreType,
   type Gender,
 } from '../utils/challengeScoring';
-import { getBodyWeightAndGenderFromParticipant } from '../utils/challengeParticipantUtils';
+import { getBodyWeightAndGenderFromParticipant, participantUserIdString } from '../utils/challengeParticipantUtils';
 import { broadcastSse } from '../utils/sse';
 
 const router = express.Router();
@@ -99,7 +99,7 @@ router.get('/', authenticateToken, async (req: Request, res: Response) => {
           const populatedUser = p.userId as any;
           const avatar = p.avatar || populatedUser?.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(p.name || populatedUser?.name || 'U')}`;
           return {
-            userId: p.userId.toString(),
+            userId: participantUserIdString(p),
             name: p.name,
             avatar,
             score: displayScoreForParticipant(c, p, bodyWeight, gender),
@@ -207,7 +207,7 @@ router.post(
       const participantsFormatted = created!.participants.map((p: any) => {
         const { bodyWeight, gender } = getBodyWeightAndGenderFromParticipant(p);
         return {
-          userId: p.userId.toString(),
+          userId: participantUserIdString(p),
           name: p.name,
           avatar: p.avatar,
           score: displayScoreForParticipant(created!, p, bodyWeight, gender),
@@ -297,7 +297,7 @@ router.put(
       );
 
       const existingParticipant = challenge.participants.find(
-        p => p.userId.toString() === userId
+        p => participantUserIdString(p) === userId
       );
 
       if (existingParticipant) {
@@ -348,7 +348,7 @@ router.put(
         }
       }
 
-      const participantIds = challenge.participants.map(p => p.userId.toString());
+      const participantIds = challenge.participants.map(p => participantUserIdString(p));
       if (!participantIds.includes(creatorId)) participantIds.push(creatorId);
       broadcastSse(participantIds, 'challenge_update');
 
@@ -372,7 +372,7 @@ router.put(
           const populatedUser = p.userId as any;
           const avatar = p.avatar || populatedUser?.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(p.name || populatedUser?.name || 'U')}`;
           return {
-            userId: p.userId.toString(),
+            userId: participantUserIdString(p),
             name: p.name,
             avatar,
             score: displayScoreForParticipant(updated!, p, bodyWeight, gender),
