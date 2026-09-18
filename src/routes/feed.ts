@@ -80,11 +80,13 @@ function serializePost(post: any, viewerId: string) {
     expiresAt: post.expiresAt ?? null,
     author: authorOf(post.userId),
     mine,
-    // Quién ha visto o dado like solo se le enseña a su autor.
+    // Quién ha visto o dado like solo se le enseña a su autor (tú no sales en tu lista).
     ...(mine && post.kind === 'story'
       ? {
-          viewCount: views.length,
-          viewers: views.filter((v: any) => v?.name).map(authorOf),
+          viewCount: views.filter((v: any) => String(v?._id ?? v) !== String(viewerId)).length,
+          viewers: views
+            .filter((v: any) => v?.name && String(v?._id ?? v) !== String(viewerId))
+            .map(authorOf),
           likers: likes.filter((l: any) => l?.name).map(authorOf),
         }
       : {}),
@@ -177,9 +179,14 @@ router.get('/stories', authenticateToken, async (req: Request, res: Response) =>
       byAuthor.get(author.id)!.items.push(serializePost(s, userId));
     });
 
-    const groups = Array.from(byAuthor.values()).sort((a, b) =>
-      a.author.id === String(userId) ? -1 : b.author.id === String(userId) ? 1 : 0
-    );
+    const groups = Array.from(byAuthor.values()).sort((a, b) => {
+      if (a.author.id === String(userId)) return -1;
+      if (b.author.id === String(userId)) return 1;
+      const aFresh = a.items.some(i => !i.viewedByMe);
+      const bFresh = b.items.some(i => !i.viewedByMe);
+      if (aFresh !== bFresh) return aFresh ? -1 : 1;
+      return 0;
+    });
     res.json({ groups });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
@@ -213,7 +220,10 @@ router.post('/posts/:id/view', authenticateToken, async (req: Request, res: Resp
     const userId = (req as any).user.userId;
     const post = await Post.findById(req.params.id).select('userId kind').lean();
     if (!post) return res.status(404).json({ error: 'Publicación no encontrada' });
-    if (String(post.userId) === String(userId)) return res.json({ ok: true });
+    if (String(post.userId) === String(userId)) {
+      await Post.updateOne({ _id: post._id }, { $addToSet: { views: toObjectId(userId) } });
+      return res.json({ ok: true });
+    }
     if (!(await areFriends(userId, String(post.userId)))) {
       return res.status(403).json({ error: 'No puedes ver esta historia' });
     }

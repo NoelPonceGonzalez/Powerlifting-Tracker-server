@@ -38,10 +38,11 @@ router.get('/stream', authenticateSse, (req: Request, res: Response) => {
 
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
+    'Cache-Control': 'no-cache, no-transform',
     Connection: 'keep-alive',
     'X-Accel-Buffering': 'no',
   });
+  res.flushHeaders?.();
 
   res.write(`data: ${JSON.stringify({ type: 'connected' })}\n\n`);
 
