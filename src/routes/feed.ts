@@ -5,12 +5,13 @@ import { body, param, validationResult } from 'express-validator';
 import { authenticateToken } from '../middleware/auth';
 import { Post } from '../models/Post';
 import { PostComment } from '../models/PostComment';
-import { Friendship } from '../models/Friendship';
 import { Notification } from '../models/Notification';
 import { User } from '../models/User';
 import { ChatMessage } from '../models/ChatMessage';
 import { isSupportedMediaType, mediaKindFromMime, mediaStorage } from '../utils/mediaStorage';
+import { canSeeContent, circleIds } from '../utils/friendship';
 import { broadcastSse } from '../utils/sse';
+import { chatIsOpen, ensurePendingChatRequest } from '../utils/chatAccess';
 
 const router = express.Router();
 
@@ -24,34 +25,6 @@ const STORY_LIFETIME_MS = 24 * 60 * 60 * 1000;
 
 function toObjectId(id: string): mongoose.Types.ObjectId {
   return new mongoose.Types.ObjectId(id);
-}
-
-/** Ids de amigos aceptados más el propio usuario: es el alcance de todo el feed. */
-async function circleIds(userId: string): Promise<mongoose.Types.ObjectId[]> {
-  const rows = await Friendship.find({
-    status: 'accepted',
-    $or: [{ requester: userId }, { recipient: userId }],
-  })
-    .select('requester recipient')
-    .lean();
-  const ids = new Set<string>([String(userId)]);
-  rows.forEach((r: any) => {
-    ids.add(String(r.requester));
-    ids.add(String(r.recipient));
-  });
-  return Array.from(ids).map(toObjectId);
-}
-
-async function areFriends(a: string, b: string): Promise<boolean> {
-  if (String(a) === String(b)) return true;
-  const found = await Friendship.findOne({
-    status: 'accepted',
-    $or: [
-      { requester: a, recipient: b },
-      { requester: b, recipient: a },
-    ],
-  }).lean();
-  return !!found;
 }
 
 function authorOf(user: any) {
@@ -172,9 +145,16 @@ router.get('/stories', authenticateToken, async (req: Request, res: Response) =>
       .populate('likes', 'name avatar')
       .lean();
 
+    const authorIds = [...new Set(stories.map(s => String((s.userId as any)?._id ?? s.userId)))];
+    const authors = authorIds.length
+      ? await User.find({ _id: { $in: authorIds } }).select('name avatar').lean()
+      : [];
+    const authorById = new Map(authors.map(u => [String(u._id), u]));
+
     const byAuthor = new Map<string, { author: ReturnType<typeof authorOf>; items: any[] }>();
     stories.forEach(s => {
-      const author = authorOf(s.userId);
+      const uid = String((s.userId as any)?._id ?? s.userId);
+      const author = authorOf(authorById.get(uid) || s.userId);
       if (!byAuthor.has(author.id)) byAuthor.set(author.id, { author, items: [] });
       byAuthor.get(author.id)!.items.push(serializePost(s, userId));
     });
@@ -199,8 +179,8 @@ router.get('/users/:userId/posts', authenticateToken, async (req: Request, res: 
     const viewerId = (req as any).user.userId;
     const target = req.params.userId;
     if (!mongoose.isValidObjectId(target)) return res.status(400).json({ error: 'Usuario inválido' });
-    if (!(await areFriends(viewerId, target))) {
-      return res.status(403).json({ error: 'Solo puedes ver las publicaciones de tus amigos' });
+    if (!(await canSeeContent(viewerId, target))) {
+      return res.status(403).json({ error: 'Solo puedes ver las publicaciones de a quien sigues' });
     }
 
     const posts = await Post.find({ userId: target, kind: 'post' })
@@ -224,7 +204,7 @@ router.post('/posts/:id/view', authenticateToken, async (req: Request, res: Resp
       await Post.updateOne({ _id: post._id }, { $addToSet: { views: toObjectId(userId) } });
       return res.json({ ok: true });
     }
-    if (!(await areFriends(userId, String(post.userId)))) {
+    if (!(await canSeeContent(userId, String(post.userId)))) {
       return res.status(403).json({ error: 'No puedes ver esta historia' });
     }
 
@@ -241,7 +221,7 @@ router.post('/posts/:id/like', authenticateToken, async (req: Request, res: Resp
     const userId = (req as any).user.userId;
     const post = await Post.findById(req.params.id);
     if (!post) return res.status(404).json({ error: 'Publicación no encontrada' });
-    if (!(await areFriends(userId, String(post.userId)))) {
+    if (!(await canSeeContent(userId, String(post.userId)))) {
       return res.status(403).json({ error: 'No puedes interactuar con esta publicación' });
     }
 
@@ -254,17 +234,35 @@ router.post('/posts/:id/like', authenticateToken, async (req: Request, res: Resp
     if (!already && String(post.userId) !== String(userId)) {
       const me = await User.findById(userId).select('name').lean();
       const story = post.kind === 'story';
+      const likeTitle = 'Nuevo me gusta';
+      const likeMessage = story
+        ? `A ${me?.name || 'alguien'} le gusta tu historia`
+        : `A ${me?.name || 'alguien'} le gusta tu publicación`;
       await Notification.create({
         userId: post.userId,
         type: 'post_like',
-        title: 'Nuevo me gusta',
-        message: story
-          ? `A ${me?.name || 'alguien'} le gusta tu historia`
-          : `A ${me?.name || 'alguien'} le gusta tu publicación`,
+        title: likeTitle,
+        message: likeMessage,
         relatedUserId: toObjectId(userId),
         relatedData: { postId: String(post._id) },
       }).catch(() => {});
-      broadcastSse([String(post.userId)], 'social_update');
+      try {
+        const { sendPushToUser } = await import('../utils/push');
+        await sendPushToUser(String(post.userId), likeTitle, likeMessage, {
+          type: 'post_like',
+          relatedUserId: String(userId),
+          postId: String(post._id),
+        });
+      } catch (e) {
+        console.error('[PUSH] Error post_like:', e);
+      }
+      broadcastSse([String(post.userId)], 'social_update', {
+        postId: String(post._id),
+        kind: story ? 'story_like' : 'post_like',
+        likeCount: post.likes.length,
+        fromId: String(userId),
+        fromName: me?.name || undefined,
+      });
     }
 
     res.json({ likeCount: post.likes.length, likedByMe: !already });
@@ -278,7 +276,7 @@ router.get('/posts/:id/comments', authenticateToken, async (req: Request, res: R
     const userId = (req as any).user.userId;
     const post = await Post.findById(req.params.id).select('userId').lean();
     if (!post) return res.status(404).json({ error: 'Publicación no encontrada' });
-    if (!(await areFriends(userId, String(post.userId)))) {
+    if (!(await canSeeContent(userId, String(post.userId)))) {
       return res.status(403).json({ error: 'No puedes ver estos comentarios' });
     }
 
@@ -313,7 +311,7 @@ router.post(
       const userId = (req as any).user.userId;
       const post = await Post.findById(req.params.id);
       if (!post) return res.status(404).json({ error: 'Publicación no encontrada' });
-      if (!(await areFriends(userId, String(post.userId)))) {
+      if (!(await canSeeContent(userId, String(post.userId)))) {
         return res.status(403).json({ error: 'No puedes comentar esta publicación' });
       }
 
@@ -340,18 +338,17 @@ router.post(
           relatedUserId: toObjectId(userId),
           relatedData: { postId: String(post._id) },
         }).catch(() => {});
-        if (story) {
-          try {
-            const { sendPushToUser } = await import('../utils/push');
-            await sendPushToUser(ownerId, 'Historia', snippet, {
-              type: 'post_comment',
-              screen: 'social',
-              tab: 'chat',
-              peerId: String(userId),
-            });
-          } catch (e) {
-            console.error('[PUSH] Error comentario de historia:', e);
-          }
+        try {
+          const { sendPushToUser } = await import('../utils/push');
+          await sendPushToUser(ownerId, story ? 'Historia' : 'Nuevo comentario', snippet, {
+            type: 'post_comment',
+            screen: 'social',
+            tab: 'chat',
+            peerId: String(userId),
+            postId: String(post._id),
+          });
+        } catch (e) {
+          console.error('[PUSH] Error post_comment:', e);
         }
       }
 
@@ -372,6 +369,7 @@ router.post(
           mediaKey: post.mediaKey,
           mediaType: post.mediaType,
           caption: post.caption || '',
+          available: true,
         };
         const base = {
           id: String(chat._id),
@@ -390,22 +388,37 @@ router.post(
           message: { ...base, mine: true, author: base.from },
           peerId: ownerId,
         });
+        if (!(await chatIsOpen(ownerId, userId))) {
+          await ensurePendingChatRequest(userId, ownerId, created.text);
+        }
       }
       const otherCommenters = await PostComment.distinct('userId', {
         postId: post._id,
         userId: { $nin: [toObjectId(userId), post.userId] },
       });
       if (otherCommenters.length > 0) {
+        const replyTitle = 'Respuesta a tu comentario';
+        const replyMessage = `${me?.name || 'Alguien'} ha respondido: ${created.text.slice(0, 80)}`;
         await Notification.insertMany(
           otherCommenters.map(uid => ({
             userId: uid,
             type: 'post_comment_reply' as const,
-            title: 'Respuesta a tu comentario',
-            message: `${me?.name || 'Alguien'} ha respondido: ${created.text.slice(0, 80)}`,
+            title: replyTitle,
+            message: replyMessage,
             relatedUserId: toObjectId(userId),
             relatedData: { postId: String(post._id) },
           }))
         ).catch(() => {});
+        try {
+          const { sendPushToUsers } = await import('../utils/push');
+          await sendPushToUsers(otherCommenters.map(id => String(id)), replyTitle, replyMessage, {
+            type: 'post_comment_reply',
+            relatedUserId: String(userId),
+            postId: String(post._id),
+          });
+        } catch (e) {
+          console.error('[PUSH] Error post_comment_reply:', e);
+        }
       }
       const notifyIds = [String(post.userId), ...otherCommenters.map(id => String(id))].filter(id => id !== String(userId));
       if (notifyIds.length) broadcastSse(notifyIds, 'social_update');
@@ -456,6 +469,10 @@ router.delete(
 
       await mediaStorage().remove(post.mediaKey);
       await PostComment.deleteMany({ postId: post._id });
+      await ChatMessage.updateMany(
+        { 'storyReply.postId': String(post._id) },
+        { $set: { 'storyReply.mediaKey': '' } }
+      );
       await post.deleteOne();
       res.json({ message: 'Publicación eliminada' });
     } catch (error: any) {

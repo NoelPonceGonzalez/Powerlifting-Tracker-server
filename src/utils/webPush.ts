@@ -84,6 +84,7 @@ export async function sendWebPushToUser(
   });
 
   const dead: string[] = [];
+  let sent = 0;
   await Promise.all(
     subs.map(async (sub) => {
       try {
@@ -95,13 +96,16 @@ export async function sendWebPushToUser(
           payload,
           { TTL: 86400, urgency: 'high' }
         );
+        sent += 1;
       } catch (err: any) {
         const status = err?.statusCode ?? err?.status;
-        if (status === 404 || status === 410) {
+        const detail = typeof err?.body === 'string' ? err.body.slice(0, 200) : err?.message;
+        if (status === 404 || status === 410 || status === 403) {
           dead.push(sub.endpoint);
+          console.warn('[WEB-PUSH] Suscripción inválida', userId, status, detail);
           return;
         }
-        console.error('[WEB-PUSH] Error enviando a', userId, status || err?.message);
+        console.error('[WEB-PUSH] Error enviando a', userId, status || err?.message, detail);
       }
     })
   );
@@ -109,7 +113,8 @@ export async function sendWebPushToUser(
   if (dead.length > 0) {
     await dropDeadEndpoints(userId, dead);
     console.warn('[WEB-PUSH] Suscripciones caducadas quitadas:', dead.length);
-  } else {
-    console.log('[WEB-PUSH] Enviado a', userId, `(${subs.length} nav.):`, title);
+  }
+  if (sent > 0) {
+    console.log('[WEB-PUSH] Enviado a', userId, `(${sent} nav.):`, title);
   }
 }

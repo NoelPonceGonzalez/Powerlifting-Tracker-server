@@ -1,9 +1,13 @@
 import { Post } from '../models/Post';
 import { PostComment } from '../models/PostComment';
 import { ChatMessage } from '../models/ChatMessage';
+import { Notification } from '../models/Notification';
 import { CHAT_MEDIA_LIFETIME_MS } from './chatMedia';
 import { mediaStorage } from './mediaStorage';
 import { logger } from './logger';
+
+const ACTIVITY_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const TEST_NOTE = /prueba|aviso de prueba|notificaciones ya llegan/i;
 
 /**
  * El índice TTL de Mongo borra el documento pero no el archivo: si nos quedamos solo con él,
@@ -43,6 +47,10 @@ export async function sweepExpiredStories(): Promise<number> {
 
   const ids = expired.map(s => s._id);
   await PostComment.deleteMany({ postId: { $in: ids } });
+  await ChatMessage.updateMany(
+    { 'storyReply.postId': { $in: ids.map(id => String(id)) } },
+    { $set: { 'storyReply.mediaKey': '' } }
+  );
   await Post.deleteMany({ _id: { $in: ids } });
 
   logger.info(`[historias] ${expired.length} caducadas borradas (archivo incluido)`);
@@ -88,11 +96,27 @@ export async function sweepExpiredChatMedia(): Promise<number> {
   return expired.length;
 }
 
+/** Actividad: se va a la semana. También se quitan avisos de prueba. */
+export async function sweepOldNotifications(): Promise<number> {
+  const cutoff = new Date(Date.now() - ACTIVITY_TTL_MS);
+  const res = await Notification.deleteMany({
+    $or: [
+      { createdAt: { $lt: cutoff } },
+      { title: TEST_NOTE },
+      { message: TEST_NOTE },
+    ],
+  });
+  const n = res.deletedCount || 0;
+  if (n > 0) logger.info(`[actividad] ${n} avisos viejos o de prueba borrados`);
+  return n;
+}
+
 /** Arranca la limpieza periódica; devuelve el temporizador por si hace falta pararlo. */
 export function startStoryCleanup(): NodeJS.Timeout {
   const run = () => {
     void sweepExpiredStories().catch(e => logger.warn('[historias] barrida fallida', e));
     void sweepExpiredChatMedia().catch(e => logger.warn('[chat] barrida de medios fallida', e));
+    void sweepOldNotifications().catch(e => logger.warn('[actividad] barrida fallida', e));
   };
   run();
   const timer = setInterval(run, SWEEP_INTERVAL_MS);

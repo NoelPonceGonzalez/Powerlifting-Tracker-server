@@ -3,6 +3,7 @@ import mongoose from 'mongoose';
 import { config } from './env';
 import { runRoutineMongoMigrations } from '../utils/routineMongoMigrations';
 import { dropUnusedMongoCollections } from '../utils/dropUnusedMongoCollections';
+import { backfillLegacyMutualFriendships } from '../utils/migrateFriendships';
 
 /**
  * Muchos routers domésticos e ISPs no resuelven registros SRV, que es lo que usa
@@ -130,6 +131,8 @@ async function attemptConnection(): Promise<void> {
     console.log(`   Base de datos: ${mongoose.connection.name}`);
     await runRoutineMongoMigrations();
     console.log('✅ Migraciones de rutinas / TM / historial aplicadas (idempotentes)');
+    await backfillLegacyMutualFriendships();
+    console.log('✅ Amistades antiguas comprobadas (parejas de un solo documento → las dos direcciones)');
     await dropUnusedMongoCollections();
   } catch (error) {
     // El primer fallo de SRV puede ser solo el DNS del router: se reintenta ya con DNS públicos.

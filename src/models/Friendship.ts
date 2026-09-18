@@ -4,6 +4,8 @@ export interface IFriendship extends Document {
   requester: mongoose.Types.ObjectId; // Usuario que envía la solicitud
   recipient: mongoose.Types.ObjectId; // Usuario que recibe la solicitud
   status: 'pending' | 'accepted' | 'rejected';
+  /** Aceptar un follow no os hace amigos: hace falta la solicitud en el otro sentido. */
+  followOnly?: boolean;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -28,6 +30,7 @@ const FriendshipSchema = new Schema<IFriendship>(
       default: 'pending',
       index: true,
     },
+    followOnly: { type: Boolean, default: false },
   },
   {
     timestamps: true,

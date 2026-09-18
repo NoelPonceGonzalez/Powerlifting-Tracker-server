@@ -10,9 +10,9 @@ import { calendarMonth1FromDateISO, dateISOFromYearWeekDay } from '../utils/cale
 import { HistoryTmSnapshot } from '../models/HistoryTmSnapshot';
 import { saveHistoryTmSnapshots, loadHistoryTmSnapshotsAsRecord } from '../utils/assembleRoutine';
 import { broadcastSse } from '../utils/sse';
-import { Friendship } from '../models/Friendship';
 import { Notification } from '../models/Notification';
 import { sendPushToUsers } from '../utils/push';
+import { followerIds } from '../utils/friendship';
 
 const router = express.Router();
 
@@ -228,14 +228,7 @@ router.put(
       if (!correction && Number.isFinite(newValue) && newValue > prevValue) {
         (async () => {
           try {
-            const friendships = await Friendship.find({
-              $or: [{ requester: userId, status: 'accepted' }, { recipient: userId, status: 'accepted' }],
-            });
-            const friendIds = friendships.map(f => {
-              const reqStr = f.requester.toString();
-              const recStr = f.recipient.toString();
-              return reqStr === userId.toString() ? recStr : reqStr;
-            });
+            const friendIds = await followerIds(userId.toString());
             if (friendIds.length === 0) return;
 
             const user = await (await import('../models/User')).User.findById(userId).select('name');

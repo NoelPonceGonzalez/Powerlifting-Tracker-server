@@ -3,7 +3,7 @@ import mongoose from 'mongoose';
 import bcrypt from 'bcryptjs';
 import { authenticateToken } from '../middleware/auth';
 import { Challenge } from '../models/Challenge';
-import { Friendship } from '../models/Friendship';
+import { mutualFriendIds } from '../utils/friendship';
 import { User } from '../models/User';
 import { Notification } from '../models/Notification';
 import { body, validationResult } from 'express-validator';
@@ -19,16 +19,10 @@ import { broadcastSse } from '../utils/sse';
 
 const router = express.Router();
 
-/** Obtiene los ObjectIds de amigos de un usuario */
+/** Amigos mutuos (las dos direcciones, o legado de un solo documento). */
 async function getFriendIds(userId: string): Promise<mongoose.Types.ObjectId[]> {
-  const friendships = await Friendship.find({
-    $or: [{ requester: userId }, { recipient: userId }],
-    status: 'accepted',
-  });
-  return friendships.map(f => {
-    const id = f.requester.toString() === userId ? f.recipient : f.requester;
-    return id as mongoose.Types.ObjectId;
-  });
+  const ids = await mutualFriendIds(userId);
+  return ids.map(id => new mongoose.Types.ObjectId(id));
 }
 
 // GET /api/challenges - Obtener challenges (propios, en los que participa, o de amigos). Filtros: status=active|finished, q=búsqueda

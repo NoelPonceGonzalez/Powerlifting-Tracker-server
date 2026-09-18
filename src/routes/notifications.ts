@@ -2,8 +2,8 @@ import express, { Request, Response } from 'express';
 import { authenticateToken, AuthRequest } from '../middleware/auth';
 import { Notification } from '../models/Notification';
 import { User } from '../models/User';
-import { Friendship } from '../models/Friendship';
 import { body, validationResult } from 'express-validator';
+import { canSeeContent } from '../utils/friendship';
 import { sendPushToUser } from '../utils/push';
 import { broadcastSse } from '../utils/sse';
 import { getVapidPublicKey, isWebPushConfigured } from '../utils/webPush';
@@ -141,15 +141,8 @@ router.post(
       const { friendUserId, gymName, time } = req.body;
 
       // Verificar amistad aceptada para evitar spam.
-      const friendship = await Friendship.findOne({
-        $or: [
-          { requester: fromUserId, recipient: friendUserId, status: 'accepted' },
-          { requester: friendUserId, recipient: fromUserId, status: 'accepted' },
-        ],
-      });
-
-      if (!friendship) {
-        return res.status(403).json({ error: 'Solo puedes notificar a amigos aceptados' });
+      if (!(await canSeeContent(String(fromUserId), String(friendUserId)))) {
+        return res.status(403).json({ error: 'Solo puedes avisar a quien sigues' });
       }
 
       const notification = new Notification({
@@ -200,7 +193,14 @@ router.get('/', authenticateToken, async (req: Request, res: Response) => {
     const limit = parseInt(req.query.limit as string) || 50;
     const unreadOnly = req.query.unread === 'true';
 
-    const query: any = { userId };
+    const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    const testNote = /prueba|aviso de prueba|notificaciones ya llegan/i;
+    const query: any = {
+      userId,
+      createdAt: { $gte: weekAgo },
+      title: { $not: testNote },
+      message: { $not: testNote },
+    };
     if (unreadOnly) {
       query.read = false;
     }

@@ -2,9 +2,9 @@ import express, { Request, Response } from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { GymCheckIn } from '../models/GymCheckIn';
 import { Notification } from '../models/Notification';
-import { Friendship } from '../models/Friendship';
 import { body, validationResult } from 'express-validator';
 import { broadcastSse } from '../utils/sse';
+import { circleIds, followerIds } from '../utils/friendship';
 
 const router = express.Router();
 
@@ -64,17 +64,7 @@ router.post(
         isNewCheckIn = true;
       }
 
-      // Obtener todos los amigos del usuario (requester/recipient son ObjectIds)
-      const friendships = await Friendship.find({
-        $or: [{ requester: userId }, { recipient: userId }],
-        status: 'accepted',
-      });
-
-      const friendIds = friendships.map(f => {
-        const reqStr = f.requester.toString();
-        const recStr = f.recipient.toString();
-        return reqStr === userId ? recStr : reqStr;
-      });
+      const friendIds = await followerIds(userId);
 
       // Crear notificaciones in-app y push para todos los amigos
       if (friendIds.length > 0 && isNewCheckIn) {
@@ -147,15 +137,7 @@ router.put(
       checkIn.timestamp = new Date();
       await checkIn.save();
 
-      const friendships = await Friendship.find({
-        $or: [{ requester: userId }, { recipient: userId }],
-        status: 'accepted',
-      });
-      const friendIds = friendships.map(f => {
-        const reqStr = f.requester.toString();
-        const recStr = f.recipient.toString();
-        return reqStr === userId ? recStr : reqStr;
-      });
+      const friendIds = await followerIds(userId);
 
       const editedTime = time !== undefined && time !== oldTime;
       const editedGym = gymName !== undefined && gymName !== oldGymName;
@@ -196,15 +178,7 @@ router.delete('/:id', authenticateToken, async (req: Request, res: Response) => 
     if (!checkIn) return res.status(404).json({ error: 'Check-in no encontrado' });
     await GymCheckIn.deleteOne({ _id: req.params.id, userId });
 
-    const friendships = await Friendship.find({
-      $or: [{ requester: userId }, { recipient: userId }],
-      status: 'accepted',
-    });
-    const friendIds = friendships.map(f => {
-      const reqStr = f.requester.toString();
-      const recStr = f.recipient.toString();
-      return reqStr === String(userId) ? recStr : reqStr;
-    });
+    const friendIds = await followerIds(String(userId));
     broadcastSse([String(userId), ...friendIds], 'checkin_update');
 
     res.status(204).send();
@@ -218,20 +192,12 @@ router.get('/', authenticateToken, async (req: Request, res: Response) => {
   try {
     const userId = (req as any).user.userId;
 
-    // Obtener lista de amigos
-    const friendships = await Friendship.find({
-      $or: [{ requester: userId }, { recipient: userId }],
-      status: 'accepted',
-    });
-
-    const friendIds = friendships.map(f => 
-      f.requester.toString() === userId ? f.recipient : f.requester
-    );
+    const authorIds = await circleIds(String(userId));
 
     // Solo check-ins aún vigentes: se borran en Mongo ~3 h después de la hora de entreno (campo expiresAt).
     const now = new Date();
     const checkIns = await GymCheckIn.find({
-      userId: { $in: [...friendIds, userId] },
+      userId: { $in: authorIds },
       expiresAt: { $gt: now },
     })
       .populate('userId', 'name email avatar')

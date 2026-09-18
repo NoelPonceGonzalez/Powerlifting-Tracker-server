@@ -21,6 +21,8 @@ import { assembleFullRoutine } from '../utils/assembleRoutine';
 import { broadcastSse, isUserOnline } from '../utils/sse';
 import { isSupportedMediaType, mediaKindFromMime, mediaStorage } from '../utils/mediaStorage';
 import { chatMediaExpiresAt, isChatMediaLive } from '../utils/chatMedia';
+import { areFriends, canSeeContent, connectionSets, describeRelation, follows, loadPair, mutualFriendIds } from '../utils/friendship';
+import { chatIsOpen, ensurePendingChatRequest, wipeDmBothSides } from '../utils/chatAccess';
 
 const router = express.Router();
 
@@ -79,19 +81,6 @@ router.get(
         return res.json([]);
       }
 
-      // Misma lógica que GET /api/social/friends: excluir amigos ya aceptados.
-      const acceptedFriendships = await Friendship.find({
-        $or: [{ requester: userIdOid }, { recipient: userIdOid }],
-        status: 'accepted',
-      }).lean();
-      const acceptedFriendIdSet = new Set<string>();
-      for (const f of acceptedFriendships) {
-        const reqId = String((f.requester as any)?.toString?.() ?? f.requester);
-        const recId = String((f.recipient as any)?.toString?.() ?? f.recipient);
-        const otherId = reqId === userId ? recId : recId === userId ? reqId : null;
-        if (otherId && otherId !== userId) acceptedFriendIdSet.add(otherId);
-      }
-
       const escaped = escapeRegex(trimmed);
 
       // Coincidencia en nombre/username sin espacios (ej. "noelpon" → "Noel Ponce González").
@@ -119,9 +108,8 @@ router.get(
         .select('name email username avatar bodyWeight')
         .limit(30);
 
-      const usersForResults = users.filter(u => !acceptedFriendIdSet.has(u._id.toString()));
+      const usersForResults = users;
 
-      // Estado pendiente / rechazado respecto a cada candidato (los aceptados ya están fuera).
       const userIds = usersForResults.map(u => u._id);
       const friendships =
         userIds.length === 0
@@ -133,19 +121,21 @@ router.get(
               ],
             });
 
-      const friendshipMap = new Map<string, string>();
-      // 'incoming' = te la enviaron a ti; 'outgoing' = la enviaste tú. La UI muestra textos distintos.
-      const directionMap = new Map<string, 'incoming' | 'outgoing'>();
+      const mineByOther = new Map<string, typeof friendships[number]>();
+      const theirsByOther = new Map<string, typeof friendships[number]>();
       const selfId = userIdOid.toString();
       friendships.forEach(f => {
         const isRequester = f.requester.toString() === selfId;
         const otherUserId = isRequester ? f.recipient.toString() : f.requester.toString();
-        friendshipMap.set(otherUserId, f.status);
-        directionMap.set(otherUserId, isRequester ? 'outgoing' : 'incoming');
+        if (isRequester) mineByOther.set(otherUserId, f);
+        else theirsByOther.set(otherUserId, f);
       });
 
-      const results = usersForResults.map(user => ({
-          id: user._id.toString(),
+      const results = usersForResults.map(user => {
+        const oid = user._id.toString();
+        const rel = describeRelation(mineByOther.get(oid), theirsByOther.get(oid));
+        return {
+          id: oid,
           name: user.name || (user as any).username || user.email,
           email: user.email,
           username: (user as any).username,
@@ -153,9 +143,11 @@ router.get(
             user.avatar ||
             `https://ui-avatars.com/api/?name=${encodeURIComponent(user.name || (user as any).username || user.email)}`,
           bodyWeight: user.bodyWeight,
-          friendshipStatus: friendshipMap.get(user._id.toString()) || null,
-          friendshipDirection: directionMap.get(user._id.toString()) || null,
-        }));
+          friendshipStatus: rel.status === 'none' ? null : rel.status,
+          friendshipDirection: rel.direction,
+          canSendRequest: rel.canSend,
+        };
+      });
 
       res.json(results);
     } catch (error: any) {
@@ -226,14 +218,8 @@ router.get('/friends/:friendId/routine', authenticateToken, async (req: Request,
     const userId = (req as any).user.userId;
     const friendId = req.params.friendId;
 
-    const friendship = await Friendship.findOne({
-      $or: [
-        { requester: userId, recipient: friendId, status: 'accepted' },
-        { requester: friendId, recipient: userId, status: 'accepted' },
-      ],
-    });
-    if (!friendship) {
-      return res.status(403).json({ error: 'Solo puedes ver la rutina de tus amigos' });
+    if (!(await canSeeContent(String(userId), String(friendId)))) {
+      return res.status(403).json({ error: 'Solo puedes ver la rutina de a quien sigues' });
     }
 
     const friendObjectId = new mongoose.Types.ObjectId(String(friendId));
@@ -277,14 +263,8 @@ router.get('/friends/:friendId/profile', authenticateToken, async (req: Request,
     const userId = (req as any).user.userId;
     const friendId = req.params.friendId;
 
-    const friendship = await Friendship.findOne({
-      $or: [
-        { requester: userId, recipient: friendId, status: 'accepted' },
-        { requester: friendId, recipient: userId, status: 'accepted' },
-      ],
-    });
-    if (!friendship) {
-      return res.status(403).json({ error: 'Solo puedes ver el perfil de tus amigos' });
+    if (!(await canSeeContent(String(userId), String(friendId)))) {
+      return res.status(403).json({ error: 'Solo puedes ver el perfil de a quien sigues' });
     }
 
     const friend = await User.findById(friendId).select('name avatar bio coachId').lean();
@@ -359,19 +339,7 @@ router.get('/friends', authenticateToken, async (req: Request, res: Response) =>
       return res.json([]);
     }
 
-    const friendships = await Friendship.find({
-      $or: [{ requester: userIdOid }, { recipient: userIdOid }],
-      status: 'accepted',
-    }).lean();
-
-    const friendIdSet = new Set<string>();
-    for (const f of friendships) {
-      const reqId = String((f.requester as any)?.toString?.() ?? f.requester);
-      const recId = String((f.recipient as any)?.toString?.() ?? f.recipient);
-      const otherId = reqId === userId ? recId : recId === userId ? reqId : null;
-      if (otherId && otherId !== userId) friendIdSet.add(otherId);
-    }
-    const friendIds = Array.from(friendIdSet);
+    const friendIds = await mutualFriendIds(userId);
 
     if (friendIds.length === 0) return res.json([]);
 
@@ -392,6 +360,59 @@ router.get('/friends', authenticateToken, async (req: Request, res: Response) =>
       });
 
     res.json(friends);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+function packPeople(
+  ids: string[],
+  userMap: Map<string, { name?: string; email?: string; avatar?: string }>,
+  canSend: Set<string>,
+  kindOf: (id: string) => 'mutual' | 'following' | 'follower'
+) {
+  return ids.map(id => {
+    const u = userMap.get(id);
+    const name = u?.name || u?.email || 'Usuario';
+    return {
+      id,
+      name,
+      avatar: u?.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(name)}`,
+      canSendRequest: canSend.has(id),
+      kind: kindOf(id),
+    };
+  });
+}
+
+/** Seguidos, seguidores y la mezcla (amigos + un solo lado). */
+router.get('/connections', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const userId = String((req as any).user.userId ?? '');
+    try {
+      new mongoose.Types.ObjectId(userId);
+    } catch {
+      return res.json({ following: [], followers: [], all: [] });
+    }
+
+    const { following, followers, mutual, pendingOutgoing } = await connectionSets(userId);
+    const allIds = Array.from(new Set([...following, ...followers, ...pendingOutgoing]));
+    const users = allIds.length
+      ? await User.find({ _id: { $in: allIds } }).select('name email avatar').lean()
+      : [];
+    const userMap = new Map(users.map((u: any) => [String(u._id), u]));
+    const canSend = new Set(
+      [...followers].filter(id => !following.has(id) && !pendingOutgoing.has(id))
+    );
+
+    const kindOf = (id: string) =>
+      mutual.has(id) ? 'mutual' as const : following.has(id) ? 'following' as const : 'follower' as const;
+
+    res.json({
+      following: packPeople(Array.from(following), userMap, canSend, kindOf),
+      followers: packPeople(Array.from(followers), userMap, canSend, kindOf),
+      all: packPeople(Array.from(new Set([...following, ...followers])), userMap, canSend, kindOf),
+      sent: packPeople(Array.from(pendingOutgoing), userMap, new Set(), () => 'following'),
+    });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -456,46 +477,34 @@ router.post(
         return res.status(404).json({ error: 'Usuario no encontrado' });
       }
 
-      // Verificar si ya existe una solicitud
-      const existing = await Friendship.findOne({
-        $or: [
-          { requester: requesterId, recipient: recipientId },
-          { requester: recipientId, recipient: requesterId },
-        ],
-      });
+      const { mine } = await loadPair(String(requesterId), String(recipientId));
+      if (await areFriends(String(requesterId), String(recipientId))) {
+        return res.status(400).json({ error: 'Ya sois amigos' });
+      }
+      if (mine?.status === 'pending') {
+        return res.status(400).json({ error: 'Ya le enviaste una solicitud; está pendiente de respuesta' });
+      }
+      if (mine?.status === 'accepted') {
+        return res.status(400).json({ error: 'Ya le enviaste la solicitud' });
+      }
 
       let friendship;
-
-      if (existing) {
-        if (existing.status === 'accepted') {
-          return res.status(400).json({ error: 'Ya sois amigos' });
-        }
-        if (existing.status === 'pending') {
-          if (String(existing.requester) === String(recipientId)) {
-            // El otro ya te la había enviado: aceptarla en vez de crear una duplicada.
-            existing.status = 'accepted';
-            await existing.save();
-            broadcastSse([requesterId, recipientId], 'social_update');
-            return res.status(200).json(existing);
-          }
-          return res.status(400).json({ error: 'Ya le enviaste una solicitud; está pendiente de respuesta' });
-        }
-        // 'rejected': se reutiliza el documento para poder volver a intentarlo.
-        existing.status = 'pending';
-        existing.requester = new mongoose.Types.ObjectId(String(requesterId));
-        existing.recipient = new mongoose.Types.ObjectId(String(recipientId));
-        await existing.save();
-        friendship = existing;
+      const mineDoc = await Friendship.findOne({ requester: requesterId, recipient: recipientId });
+      if (mineDoc) {
+        mineDoc.status = 'pending';
+        mineDoc.followOnly = false;
+        await mineDoc.save();
+        friendship = mineDoc;
       } else {
         friendship = new Friendship({
           requester: requesterId,
           recipient: recipientId,
           status: 'pending',
+          followOnly: false,
         });
         await friendship.save();
       }
 
-      // Crear notificación para el destinatario
       const requester = await User.findById(requesterId);
       const requesterName = requester?.name || requester?.email || 'Alguien';
       const notification = new Notification({
@@ -550,29 +559,56 @@ router.put('/requests/:id/accept', authenticateToken, async (req: Request, res: 
     }
 
     friendship.status = 'accepted';
+    friendship.followOnly = true;
     await friendship.save();
 
-    // Crear notificación para el solicitante
+    const nowFriends = await areFriends(String(userId), String(friendship.requester));
+    if (nowFriends) {
+      await Friendship.updateMany(
+        {
+          status: 'accepted',
+          $or: [
+            { requester: userId, recipient: friendship.requester },
+            { requester: friendship.requester, recipient: userId },
+          ],
+        },
+        { $set: { followOnly: false } }
+      );
+    }
+
     const currentUser = await User.findById(userId);
+    const requesterUser = await User.findById(friendship.requester).select('name email');
     const acceptorName = currentUser?.name || currentUser?.email || 'Alguien';
-    const notification = new Notification({
+    const requesterName = requesterUser?.name || requesterUser?.email || 'Alguien';
+    await Notification.create({
       userId: friendship.requester,
       type: 'friend_accepted',
       title: `${acceptorName} ha aceptado tu solicitud`,
-      message: '¡Ahora sois amigos!',
+      message: nowFriends ? '¡Ahora sois amigos!' : 'Aún no sois amigos: tiene que enviarte solicitud también.',
       relatedUserId: userId,
     });
+    await Notification.create({
+      userId,
+      type: 'friend_accepted',
+      title: `${requesterName} ahora te sigue`,
+      message: `${requesterName} ahora te sigue`,
+      relatedUserId: friendship.requester,
+      relatedData: { kind: 'new_follower' },
+    });
 
-    await notification.save();
-
-    // Push al móvil del solicitante (llega aunque la app esté cerrada)
     try {
       const { sendPushToUser } = await import('../utils/push');
       await sendPushToUser(
         String(friendship.requester),
         `${acceptorName} ha aceptado tu solicitud`,
-        '¡Ahora sois amigos!',
+        nowFriends ? '¡Ahora sois amigos!' : 'Aún no sois amigos: envíale tú también la solicitud.',
         { type: 'friend_accepted', relatedUserId: String(userId) }
+      );
+      await sendPushToUser(
+        String(userId),
+        `${requesterName} ahora te sigue`,
+        `${requesterName} ahora te sigue`,
+        { type: 'friend_accepted', relatedUserId: String(friendship.requester), kind: 'new_follower' }
       );
     } catch (e) {
       console.error('[PUSH] Error friend_accepted:', e);
@@ -703,19 +739,7 @@ router.get('/friends/routine-progress', authenticateToken, async (req: Request, 
       return res.json({ entries: [] });
     }
 
-    const friendships = await Friendship.find({
-      $or: [{ requester: userIdOid }, { recipient: userIdOid }],
-      status: 'accepted',
-    }).lean();
-
-    const friendIdSet = new Set<string>();
-    for (const f of friendships) {
-      const reqId = String((f.requester as any)?.toString?.() ?? f.requester);
-      const recId = String((f.recipient as any)?.toString?.() ?? f.recipient);
-      const otherId = reqId === userId ? recId : recId === userId ? reqId : null;
-      if (otherId && otherId !== userId) friendIdSet.add(otherId);
-    }
-    const friendIds = Array.from(friendIdSet);
+    const friendIds = await mutualFriendIds(userId);
 
     const targetIds = [userId, ...friendIds];
 
@@ -781,25 +805,17 @@ router.get('/users/:userId/profile', authenticateToken, async (req: Request, res
     if (!target) return res.status(404).json({ error: 'Usuario no encontrado' });
 
     const isSelf = String(targetId) === String(viewerId);
-    const friendship = isSelf
-      ? null
-      : await Friendship.findOne({
-          $or: [
-            { requester: viewerId, recipient: targetId },
-            { requester: targetId, recipient: viewerId },
-          ],
-        }).lean();
-    const isFriend = isSelf || friendship?.status === 'accepted';
+    const pair = isSelf ? { mine: null, theirs: null } : await loadPair(String(viewerId), String(targetId));
+    const rel = describeRelation(pair.mine, pair.theirs);
+    const isFriend = isSelf || rel.status === 'accepted' || rel.status === 'following';
 
-    const [postCount, friendCount, athleteCount, coach] = await Promise.all([
+    const [postCount, sets, athleteCount, coach] = await Promise.all([
       Post.countDocuments({ userId: targetId, kind: 'post' }),
-      Friendship.countDocuments({
-        status: 'accepted',
-        $or: [{ requester: targetId }, { recipient: targetId }],
-      }),
+      connectionSets(String(targetId)),
       User.countDocuments({ coachId: targetId }),
       target.coachId ? User.findById(target.coachId).select('name avatar').lean() : null,
     ]);
+    const friendCount = sets.mutual.size;
 
     /** Pedir que me entrene (yo soy el alumno) o invitarle a entrenarle (yo soy el coach). */
     const [coachRequest, athleteInvite] = isSelf
@@ -827,13 +843,13 @@ router.get('/users/:userId/profile', authenticateToken, async (req: Request, res
       bio: target.bio || '',
       isSelf,
       isFriend,
-      friendshipStatus: isSelf ? 'self' : friendship?.status ?? 'none',
+      friendshipStatus: isSelf ? 'self' : rel.status,
+      canSendRequest: !isSelf && rel.canSend,
       postCount,
       friendCount,
       athleteCount,
-      /** Cifras de escaparate: no cambian nada, solo dan vida al perfil. */
-      followerCount: friendCount + athleteCount,
-      followingCount: friendCount + (target.coachId ? 1 : 0),
+      followerCount: sets.followers.size,
+      followingCount: sets.following.size,
       coachRequestStatus: coachRequest?.status ?? 'none',
       athleteInviteStatus: athleteInvite?.status ?? 'none',
       iAmTheirCoach: !isSelf && String(target.coachId || '') === String(viewerId),
@@ -862,15 +878,7 @@ router.get('/users/:userId/training-maxes/:tmId/history', authenticateToken, asy
     }
 
     const isSelf = viewerId === targetId;
-    const friendship = isSelf
-      ? null
-      : await Friendship.findOne({
-          status: 'accepted',
-          $or: [
-            { requester: viewerId, recipient: targetId },
-            { requester: targetId, recipient: viewerId },
-          ],
-        }).lean();
+    const friendship = isSelf ? false : await canSeeContent(viewerId, targetId);
     const target = await User.findById(targetId).select('coachId').lean();
     const iAmCoach = !!(target && String(target.coachId || '') === viewerId);
     if (!isSelf && !friendship && !iAmCoach) {
@@ -995,14 +1003,9 @@ router.post('/coach-requests', authenticateToken, async (req: Request, res: Resp
     }
     if (coachId === athleteId) return res.status(400).json({ error: 'No puedes ser tu propio entrenador' });
 
-    const friendship = await Friendship.findOne({
-      status: 'accepted',
-      $or: [
-        { requester: athleteId, recipient: coachId },
-        { requester: coachId, recipient: athleteId },
-      ],
-    }).lean();
-    if (!friendship) return res.status(403).json({ error: 'Primero tenéis que ser amigos' });
+    if (!(await areFriends(athleteId, coachId))) {
+      return res.status(403).json({ error: 'Primero tenéis que ser amigos' });
+    }
 
     const [coach, athlete] = await Promise.all([
       User.findById(coachId).select('name avatar').lean(),
@@ -1030,15 +1033,27 @@ router.post('/coach-requests', authenticateToken, async (req: Request, res: Resp
 
     const notifyUser = asCoach ? athleteId : coachId;
     const fromName = asCoach ? coach.name : athlete.name;
+    const coachTitle = asCoach ? 'Te quieren entrenar' : 'Te piden ser entrenador';
+    const coachMessage = asCoach
+      ? `${fromName || 'Alguien'} quiere ser tu entrenador`
+      : `${fromName || 'Alguien'} quiere que seas su entrenador`;
     await Notification.create({
       userId: notifyUser,
       type: 'coach_request',
-      title: asCoach ? 'Te quieren entrenar' : 'Te piden ser entrenador',
-      message: asCoach
-        ? `${fromName || 'Alguien'} quiere ser tu entrenador`
-        : `${fromName || 'Alguien'} quiere que seas su entrenador`,
+      title: coachTitle,
+      message: coachMessage,
       relatedUserId: new mongoose.Types.ObjectId(me),
     }).catch(() => {});
+    try {
+      const { sendPushToUser } = await import('../utils/push');
+      await sendPushToUser(String(notifyUser), coachTitle, coachMessage, {
+        type: 'coach_request',
+        relatedUserId: String(me),
+      });
+    } catch (e) {
+      console.error('[PUSH] Error coach_request:', e);
+    }
+    broadcastSse([String(notifyUser), String(me)], 'social_update');
 
     res.status(201).json({ status: 'pending' });
   } catch (error: any) {
@@ -1130,15 +1145,27 @@ router.put('/coach-requests/:id/:decision', authenticateToken, async (req: Reque
       );
       const meUser = await User.findById(userId).select('name').lean();
       const otherId = iAmCoach ? request.athlete : request.coach;
+      const acceptedTitle = 'Entrenador confirmado';
+      const acceptedMessage = iAmCoach
+        ? `${meUser?.name || 'Tu entrenador'} ha aceptado entrenarte`
+        : `${meUser?.name || 'Alguien'} te ha aceptado como entrenador`;
       await Notification.create({
         userId: otherId,
         type: 'coach_accepted',
-        title: 'Entrenador confirmado',
-        message: iAmCoach
-          ? `${meUser?.name || 'Tu entrenador'} ha aceptado entrenarte`
-          : `${meUser?.name || 'Alguien'} te ha aceptado como entrenador`,
+        title: acceptedTitle,
+        message: acceptedMessage,
         relatedUserId: new mongoose.Types.ObjectId(userId),
       }).catch(() => {});
+      try {
+        const { sendPushToUser } = await import('../utils/push');
+        await sendPushToUser(String(otherId), acceptedTitle, acceptedMessage, {
+          type: 'coach_accepted',
+          relatedUserId: String(userId),
+        });
+      } catch (e) {
+        console.error('[PUSH] Error coach_accepted:', e);
+      }
+      broadcastSse([String(otherId), userId], 'social_update');
     }
 
     res.json({ status: request.status });
@@ -1179,6 +1206,59 @@ function chatAttachmentFields(media: { mediaKey: string; mediaType: 'image' | 'v
   };
 }
 
+type StoryReplySnap = {
+  postId?: string;
+  mediaKey?: string;
+  mediaType?: string;
+  caption?: string;
+} | null;
+
+type LiveStoryMedia = { mediaKey: string; mediaType: 'image' | 'video' };
+
+function hasStoryReply(reply?: StoryReplySnap) {
+  return !!(reply && (reply.postId || reply.mediaKey));
+}
+
+async function liveStoryLookup(rows: Array<{ storyReply?: StoryReplySnap }>) {
+  const postIds: string[] = [];
+  const mediaKeys: string[] = [];
+  for (const row of rows) {
+    const reply = row.storyReply;
+    if (!reply) continue;
+    if (reply.postId && mongoose.isValidObjectId(reply.postId)) postIds.push(reply.postId);
+    if (reply.mediaKey) mediaKeys.push(reply.mediaKey);
+  }
+  const byKey = new Map<string, LiveStoryMedia>();
+  if (postIds.length === 0 && mediaKeys.length === 0) return byKey;
+  const clauses = [
+    postIds.length ? { _id: { $in: [...new Set(postIds)] } } : null,
+    mediaKeys.length ? { mediaKey: { $in: [...new Set(mediaKeys)] } } : null,
+  ].filter(Boolean);
+  const posts = await Post.find({ $or: clauses })
+    .select('_id mediaKey mediaType')
+    .lean();
+  for (const post of posts) {
+    if (!post.mediaKey) continue;
+    const media: LiveStoryMedia = {
+      mediaKey: post.mediaKey,
+      mediaType: post.mediaType === 'video' ? 'video' : 'image',
+    };
+    byKey.set(String(post._id), media);
+    byKey.set(post.mediaKey, media);
+  }
+  return byKey;
+}
+
+function liveStoryMedia(
+  reply: StoryReplySnap,
+  live: Map<string, LiveStoryMedia>
+): LiveStoryMedia | null {
+  if (!reply) return null;
+  if (reply.postId && live.has(reply.postId)) return live.get(reply.postId) || null;
+  if (reply.mediaKey && live.has(reply.mediaKey)) return live.get(reply.mediaKey) || null;
+  return null;
+}
+
 function serializeChatLine(
   row: {
     _id: unknown;
@@ -1188,27 +1268,29 @@ function serializeChatLine(
     mediaType?: string | null;
     mediaExpiresAt?: Date | string | null;
     createdAt: Date;
-    storyReply?: {
-      postId?: string;
-      mediaKey?: string;
-      mediaType?: string;
-      caption?: string;
-    } | null;
+    storyReply?: StoryReplySnap;
   },
   me: string,
-  author?: ReturnType<typeof authorCard>
+  author?: ReturnType<typeof authorCard>,
+  liveStory?: LiveStoryMedia | null | 'snapshot'
 ) {
   const live = isChatMediaLive(row);
   const reply = row.storyReply;
+  const showStory = hasStoryReply(reply);
+  const snapshot = liveStory === 'snapshot' || liveStory === undefined;
+  const fromPost = !snapshot && liveStory ? liveStory : null;
+  const goneFromDb = !snapshot && !fromPost;
+  const mediaKey = goneFromDb ? '' : fromPost?.mediaKey || reply?.mediaKey || '';
   return {
     id: String(row._id),
     text: row.text || '',
-    storyReply: reply?.mediaKey
+    storyReply: showStory
       ? {
-          postId: reply.postId || '',
-          mediaKey: reply.mediaKey,
-          mediaType: (reply.mediaType === 'video' ? 'video' : 'image') as 'image' | 'video',
-          caption: reply.caption || '',
+          postId: reply?.postId || '',
+          mediaKey,
+          mediaType: (fromPost?.mediaType || (reply?.mediaType === 'video' ? 'video' : 'image')) as 'image' | 'video',
+          caption: reply?.caption || '',
+          available: !goneFromDb && !!mediaKey,
         }
       : null,
     mediaKey: live ? row.mediaKey || null : null,
@@ -1239,26 +1321,34 @@ async function readChatAttachment(req: Request): Promise<{ mediaKey: string; med
 
 async function canTalk(me: string, other: string): Promise<boolean> {
   if (me === other || !mongoose.isValidObjectId(other)) return false;
-  const friends = await Friendship.findOne({
-    status: 'accepted',
+  if (await chatIsOpen(me, other)) return true;
+  if (await follows(other, me)) return true;
+  return !!(await ChatRequest.exists({
+    status: { $in: ['pending', 'accepted'] },
     $or: [
-      { requester: me, recipient: other },
-      { requester: other, recipient: me },
+      { from: me, to: other },
+      { from: other, to: me },
     ],
-  }).lean();
-  if (friends) return true;
-  const [iTrainWithThem, theyTrainWithMe, chatOk] = await Promise.all([
-    User.exists({ _id: me, coachId: other }),
-    User.exists({ _id: other, coachId: me }),
-    ChatRequest.exists({
-      status: 'accepted',
-      $or: [
-        { from: me, to: other },
-        { from: other, to: me },
-      ],
-    }),
-  ]);
-  return !!(iTrainWithThem || theyTrainWithMe || chatOk);
+  }));
+}
+
+/** Si le escribo a alguien que ya me sigue, abrimos el chat: no le sigo, pero sí podemos hablar. */
+async function openTalkIfTheyFollowMe(me: string, other: string): Promise<void> {
+  if (!(await follows(other, me))) return;
+  const existing = await ChatRequest.findOne({
+    $or: [
+      { from: me, to: other },
+      { from: other, to: me },
+    ],
+  });
+  if (existing) {
+    if (existing.status !== 'accepted') {
+      existing.status = 'accepted';
+      await existing.save();
+    }
+    return;
+  }
+  await ChatRequest.create({ from: me, to: other, status: 'accepted' });
 }
 
 async function notifyChatRequest(fromId: string, toId: string, preview: string) {
@@ -1470,7 +1560,7 @@ router.get('/chats', authenticateToken, async (req: Request, res: Response) => {
       seen.add(peerId);
       dmThreads.push({
         peerId,
-        lastText: row.storyReply?.mediaKey
+        lastText: hasStoryReply(row.storyReply)
           ? (row.text ? `Historia · ${row.text}` : 'Respondió a tu historia')
           : lastPreview(row.text, row.mediaType, isChatMediaLive(row)),
         lastAt: row.createdAt.toISOString(),
@@ -1520,10 +1610,13 @@ router.get('/chats', authenticateToken, async (req: Request, res: Response) => {
     const unreadByGroup = new Map(groupUnread.map(r => [String(r._id), r.n]));
 
     const outgoingChat = await ChatRequest.find({ from: me, status: 'pending' }).lean();
+    const incomingChat = await ChatRequest.find({ to: me, status: 'pending' }).lean();
+    const incomingIds = new Set(incomingChat.map(r => String(r.from)));
     const peopleIds = [
       ...dmThreads.map(t => t.peerId),
       ...(coachId ? [coachId] : []),
       ...outgoingChat.map(r => String(r.to)),
+      ...incomingChat.map(r => String(r.from)),
       ...groups.flatMap(g => g.members.map(id => String(id))),
     ];
     const users = await User.find({ _id: { $in: [...new Set(peopleIds)] } })
@@ -1543,6 +1636,7 @@ router.get('/chats', authenticateToken, async (req: Request, res: Response) => {
         lastAt: thread.lastAt,
         unread: thread.unread,
         isCoach: coachId === thread.peerId,
+        incoming: incomingIds.has(thread.peerId),
       });
     }
 
@@ -1558,6 +1652,24 @@ router.get('/chats', authenticateToken, async (req: Request, res: Response) => {
           isCoach: true,
         });
       }
+    }
+
+    for (const req of incomingChat) {
+      const peerId = String(req.from);
+      if (threads.some(t => t.kind === 'dm' && (t.peer as { id: string }).id === peerId)) continue;
+      const hiddenAt = hideDm.get(peerId);
+      if (hiddenAt && req.updatedAt <= hiddenAt) continue;
+      const user = byId.get(peerId);
+      if (!user) continue;
+      threads.push({
+        kind: 'dm',
+        peer: authorCard(user),
+        lastText: req.preview || 'Quiere chatear',
+        lastAt: req.updatedAt.toISOString(),
+        unread: 1,
+        isCoach: false,
+        incoming: true,
+      });
     }
 
     for (const req of outgoingChat) {
@@ -1851,6 +1963,7 @@ router.get('/chats/groups/:groupId/messages', authenticateToken, async (req: Req
       { $addToSet: { readBy: me } }
     );
 
+    const liveStories = await liveStoryLookup(rows);
     res.json({
       group: await serializeGroupCard(group),
       messages: rows.map(row => {
@@ -1858,7 +1971,8 @@ router.get('/chats/groups/:groupId/messages', authenticateToken, async (req: Req
         return serializeChatLine(
           row,
           me,
-          author ? authorCard(author) : { id: String(row.from), name: 'Atleta', avatar: null, online: false }
+          author ? authorCard(author) : { id: String(row.from), name: 'Atleta', avatar: null, online: false },
+          liveStoryMedia(row.storyReply, liveStories)
         );
       }),
     });
@@ -1933,18 +2047,14 @@ router.put('/chats/chat-requests/:id/accept', authenticateToken, async (req: Req
     if (!request) return res.status(404).json({ error: 'Solicitud no encontrada' });
     request.status = 'accepted';
     await request.save();
-    if (request.preview) {
-      await ChatMessage.create({ from: request.from, to: me, text: request.preview });
-    }
-    const friendship = await Friendship.findOne({
-      $or: [
-        { requester: request.from, recipient: me },
-        { requester: me, recipient: request.from },
-      ],
+    const already = await ChatMessage.exists({
+      groupId: null,
+      from: request.from,
+      to: me,
+      text: request.preview || '',
     });
-    if (friendship && friendship.status === 'pending') {
-      friendship.status = 'accepted';
-      await friendship.save();
+    if (request.preview && !already) {
+      await ChatMessage.create({ from: request.from, to: me, text: request.preview });
     }
     broadcastSse([me, String(request.from)], 'social_update');
     res.json({ ok: true, peerId: String(request.from) });
@@ -1956,14 +2066,12 @@ router.put('/chats/chat-requests/:id/accept', authenticateToken, async (req: Req
 router.put('/chats/chat-requests/:id/reject', authenticateToken, async (req: Request, res: Response) => {
   try {
     const me = String((req as any).user.userId);
-    const request = await ChatRequest.findOneAndUpdate(
-      { _id: req.params.id, to: me, status: 'pending' },
-      { status: 'rejected' },
-      { new: true }
-    );
+    const request = await ChatRequest.findOne({ _id: req.params.id, to: me, status: 'pending' });
     if (!request) return res.status(404).json({ error: 'Solicitud no encontrada' });
-    broadcastSse([me, String(request.from)], 'social_update');
-    res.json({ ok: true });
+    const fromId = String(request.from);
+    await wipeDmBothSides(me, fromId);
+    broadcastSse([me, fromId], 'social_update');
+    res.json({ ok: true, peerId: fromId, rejected: true });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -1988,50 +2096,69 @@ router.delete('/chats/:peerId', authenticateToken, async (req: Request, res: Res
   }
 });
 
+async function loadDmLines(me: string, peerId: string) {
+  const hiddenAt = await chatHiddenAt(me, 'dm', peerId);
+  const rows = await ChatMessage.find({
+    groupId: null,
+    $or: [
+      { from: me, to: peerId },
+      { from: peerId, to: me },
+    ],
+    ...afterHidden(hiddenAt),
+  })
+    .sort({ createdAt: 1 })
+    .limit(200)
+    .lean();
+  const liveStories = await liveStoryLookup(rows);
+  return rows.map(row => serializeChatLine(row, me, undefined, liveStoryMedia(row.storyReply, liveStories)));
+}
+
 router.get('/chats/:peerId/messages', authenticateToken, async (req: Request, res: Response) => {
   try {
     const me = String((req as any).user.userId);
     const peerId = String(req.params.peerId);
-    if (await canTalk(me, peerId)) {
-      const hiddenAt = await chatHiddenAt(me, 'dm', peerId);
-      const rows = await ChatMessage.find({
-        groupId: null,
-        $or: [
-          { from: me, to: peerId },
-          { from: peerId, to: me },
-        ],
-        ...afterHidden(hiddenAt),
-      })
-        .sort({ createdAt: 1 })
-        .limit(200)
-        .lean();
-
-      await ChatMessage.updateMany({ groupId: null, from: peerId, to: me, readAt: null }, { $set: { readAt: new Date() } });
-
-      return res.json({
-        waiting: false,
-        online: isUserOnline(peerId),
-        messages: rows.map(row => serializeChatLine(row, me)),
-      });
-    }
-
     const outgoing = await ChatRequest.findOne({ from: me, to: peerId, status: 'pending' }).lean();
+    const incoming = await ChatRequest.findOne({ from: peerId, to: me, status: 'pending' }).lean();
+    const messages = await loadDmLines(me, peerId);
+    const online = isUserOnline(peerId);
+
     if (outgoing) {
       return res.json({
         waiting: true,
+        incoming: false,
         preview: outgoing.preview || '',
-        messages: outgoing.preview
-          ? [{ id: 'preview', text: outgoing.preview, createdAt: outgoing.createdAt.toISOString(), mine: true }]
-          : [],
+        requestId: String(outgoing._id),
+        online,
+        messages: messages.length
+          ? messages
+          : outgoing.preview
+            ? [{ id: 'preview', text: outgoing.preview, createdAt: outgoing.createdAt.toISOString(), mine: true }]
+            : [],
       });
     }
 
-    const incoming = await ChatRequest.findOne({ from: peerId, to: me, status: 'pending' }).lean();
-    if (incoming) {
-      return res.json({ waiting: false, incoming: true, messages: [] });
+    if (incoming || (!(await chatIsOpen(me, peerId)) && messages.some(m => !m.mine))) {
+      const request = incoming || (await ensurePendingChatRequest(peerId, me, messages.find(m => !m.mine)?.text || ''));
+      return res.json({
+        waiting: false,
+        incoming: true,
+        requestId: request ? String(request._id) : undefined,
+        online,
+        messages,
+      });
     }
 
-    return res.json({ waiting: false, locked: true, messages: [] });
+    if (await chatIsOpen(me, peerId)) {
+      await ChatMessage.updateMany({ groupId: null, from: peerId, to: me, readAt: null }, { $set: { readAt: new Date() } });
+      return res.json({
+        waiting: false,
+        incoming: false,
+        online,
+        messages,
+      });
+    }
+
+    return res.json({ waiting: false, locked: true, incoming: false, messages: [] });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -2090,12 +2217,16 @@ router.post('/chats/:peerId/messages', authenticateToken, optionalChatFile, asyn
     };
 
     if (await canTalk(me, peerId)) {
+      await openTalkIfTheyFollowMe(me, peerId);
       const created = await ChatMessage.create({
         from: me,
         to: peerId,
         text,
         ...chatAttachmentFields(media),
       });
+      if (!(await chatIsOpen(peerId, me))) {
+        await ensurePendingChatRequest(me, peerId, text);
+      }
       return res.status(201).json(await deliver(created));
     }
 
