@@ -4,6 +4,8 @@ import { config } from './env';
 import { runRoutineMongoMigrations } from '../utils/routineMongoMigrations';
 import { dropUnusedMongoCollections } from '../utils/dropUnusedMongoCollections';
 import { backfillLegacyMutualFriendships } from '../utils/migrateFriendships';
+import { dedupeUsersByEmail } from '../utils/dedupeUsersByEmail';
+import { migrateInlineAvatars } from '../utils/avatarMedia';
 
 /**
  * Muchos routers domésticos e ISPs no resuelven registros SRV, que es lo que usa
@@ -133,6 +135,9 @@ async function attemptConnection(): Promise<void> {
     console.log('✅ Migraciones de rutinas / TM / historial aplicadas (idempotentes)');
     await backfillLegacyMutualFriendships();
     console.log('✅ Amistades antiguas comprobadas (parejas de un solo documento → las dos direcciones)');
+    await dedupeUsersByEmail();
+    console.log('✅ Cuentas duplicadas por email comprobadas (un correo = una cuenta)');
+    await migrateInlineAvatars();
     await dropUnusedMongoCollections();
   } catch (error) {
     // El primer fallo de SRV puede ser solo el DNS del router: se reintenta ya con DNS públicos.

@@ -68,13 +68,19 @@ function topWinners(ranked: RankRow[], usePoints: boolean): RankRow[] {
 }
 
 async function processOneChallenge(challenge: any): Promise<void> {
-  const c = challenge;
+  const claimed = await Challenge.findOneAndUpdate(
+    {
+      _id: challenge._id,
+      $or: [{ winnerNotifiedAt: null }, { winnerNotifiedAt: { $exists: false } }],
+    },
+    { $set: { winnerNotifiedAt: new Date() } }
+  );
+  if (!claimed) return;
+
+  const c = claimed;
   const participants = c.participants || [];
 
-  if (participants.length === 0) {
-    await Challenge.updateOne({ _id: c._id }, { $set: { winnerNotifiedAt: new Date() } });
-    return;
-  }
+  if (participants.length === 0) return;
 
   const ranked = rankParticipantsForChallenge({
     type: c.type,
@@ -131,8 +137,6 @@ async function processOneChallenge(challenge: any): Promise<void> {
   }
 
   broadcastSse(userIds, 'challenge_update');
-
-  await Challenge.updateOne({ _id: c._id }, { $set: { winnerNotifiedAt: new Date() } });
 }
 
 /**

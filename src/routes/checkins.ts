@@ -5,6 +5,7 @@ import { Notification } from '../models/Notification';
 import { body, validationResult } from 'express-validator';
 import { broadcastSse } from '../utils/sse';
 import { circleIds, followerIds } from '../utils/friendship';
+import { publicListAvatar } from '../utils/avatarMedia';
 
 const router = express.Router();
 
@@ -90,7 +91,7 @@ router.post(
             friendIds,
             notifTitle,
             notifMessage,
-            { type: 'gym_checkin', gymName, time }
+            { type: 'gym_checkin', gymName, time, relatedUserId: String(userId) }
           );
         } catch (e) {
           console.error('[PUSH] Error gym_checkin:', e);
@@ -155,7 +156,12 @@ router.put(
         await Notification.insertMany(notifications);
         try {
           const { sendPushToUsers } = await import('../utils/push');
-          await sendPushToUsers(friendIds, notifTitle, notifMessage, { type: 'gym_checkin', gymName: checkIn.gymName, time: checkIn.time });
+          await sendPushToUsers(friendIds, notifTitle, notifMessage, {
+            type: 'gym_checkin',
+            gymName: checkIn.gymName,
+            time: checkIn.time,
+            relatedUserId: String(userId),
+          });
         } catch (e) {
           console.error('[PUSH] Error gym_checkin edit:', e);
         }
@@ -222,7 +228,7 @@ router.get('/', authenticateToken, async (req: Request, res: Response) => {
         id: ci._id.toString(),
         userId,
         userName,
-        avatar: userDoc?.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(userName)}`,
+        avatar: publicListAvatar(userDoc?.avatar, userId),
         gymName: ci.gymName,
         time: ci.time,
         timestamp: ci.timestamp.getTime(),

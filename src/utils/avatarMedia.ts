@@ -15,11 +15,30 @@ export function isAvatarMediaKey(value?: string | null): boolean {
   return !!value && KEY_RE.test(value.trim());
 }
 
+const FAKE_AVATAR = /picsum\.photos|ui-avatars\.com|pravatar\.cc|randomuser\.me/i;
+
 /** Lo que se manda al cliente: clave o URL, nunca un data: enorme. */
 export function publicAvatarRef(value?: string | null): string {
   const raw = (value || '').trim();
-  if (!raw || isInlineAvatar(raw)) return '';
+  if (!raw || isInlineAvatar(raw) || FAKE_AVATAR.test(raw)) return '';
   return raw;
+}
+
+/**
+ * URL que el cliente puede poner en <img>. Si hay foto real (clave o data:),
+ * se sirve por /api/media/user/:id para que se vea en perfil, social y chats.
+ */
+export function publicListAvatar(value?: string | null, userId?: string): string {
+  const raw = (value || '').trim();
+  if (!raw || FAKE_AVATAR.test(raw)) return '';
+  if (raw.startsWith('http://') || raw.startsWith('https://')) return raw;
+  const id = String(userId || '').trim();
+  if (!id) {
+    if (isInlineAvatar(raw)) return '';
+    return publicAvatarRef(raw);
+  }
+  const version = isAvatarMediaKey(raw) ? raw.slice(-12) : 'live';
+  return `/api/media/user/${id}?v=${encodeURIComponent(version)}`;
 }
 
 export async function saveAvatarBuffer(buffer: Buffer, mimeType: string): Promise<string> {

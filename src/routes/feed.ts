@@ -12,6 +12,7 @@ import { isSupportedMediaType, mediaKindFromMime, mediaStorage } from '../utils/
 import { canSeeContent, circleIds } from '../utils/friendship';
 import { broadcastSse } from '../utils/sse';
 import { chatIsOpen, ensurePendingChatRequest } from '../utils/chatAccess';
+import { publicListAvatar } from '../utils/avatarMedia';
 
 const router = express.Router();
 
@@ -31,7 +32,7 @@ function authorOf(user: any) {
   return {
     id: String(user?._id ?? user?.id ?? ''),
     name: user?.name || 'Usuario',
-    avatar: user?.avatar || null,
+    avatar: publicListAvatar(user?.avatar, String(user?._id ?? user?.id ?? '')) || null,
   };
 }
 
@@ -238,23 +239,37 @@ router.post('/posts/:id/like', authenticateToken, async (req: Request, res: Resp
       const likeMessage = story
         ? `A ${me?.name || 'alguien'} le gusta tu historia`
         : `A ${me?.name || 'alguien'} le gusta tu publicación`;
-      await Notification.create({
+      const likeRecent = await Notification.findOne({
         userId: post.userId,
         type: 'post_like',
-        title: likeTitle,
-        message: likeMessage,
         relatedUserId: toObjectId(userId),
-        relatedData: { postId: String(post._id) },
-      }).catch(() => {});
-      try {
-        const { sendPushToUser } = await import('../utils/push');
-        await sendPushToUser(String(post.userId), likeTitle, likeMessage, {
+        'relatedData.postId': String(post._id),
+        read: false,
+        createdAt: { $gte: new Date(Date.now() - 30 * 60 * 1000) },
+      });
+      if (likeRecent) {
+        likeRecent.title = likeTitle;
+        likeRecent.message = likeMessage;
+        await likeRecent.save().catch(() => {});
+      } else {
+        await Notification.create({
+          userId: post.userId,
           type: 'post_like',
-          relatedUserId: String(userId),
-          postId: String(post._id),
-        });
-      } catch (e) {
-        console.error('[PUSH] Error post_like:', e);
+          title: likeTitle,
+          message: likeMessage,
+          relatedUserId: toObjectId(userId),
+          relatedData: { postId: String(post._id) },
+        }).catch(() => {});
+        try {
+          const { sendPushToUser } = await import('../utils/push');
+          await sendPushToUser(String(post.userId), likeTitle, likeMessage, {
+            type: 'post_like',
+            relatedUserId: String(userId),
+            postId: String(post._id),
+          });
+        } catch (e) {
+          console.error('[PUSH] Error post_like:', e);
+        }
       }
       broadcastSse([String(post.userId)], 'social_update', {
         postId: String(post._id),
@@ -420,7 +435,9 @@ router.post(
           console.error('[PUSH] Error post_comment_reply:', e);
         }
       }
-      const notifyIds = [String(post.userId), ...otherCommenters.map(id => String(id))].filter(id => id !== String(userId));
+      const notifyIds = otherCommenters
+        .map(id => String(id))
+        .filter(id => id !== String(userId) && !(story && id === ownerId));
       if (notifyIds.length) broadcastSse(notifyIds, 'social_update');
 
       res.status(201).json({

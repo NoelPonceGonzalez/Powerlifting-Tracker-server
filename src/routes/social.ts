@@ -23,6 +23,7 @@ import { isSupportedMediaType, mediaKindFromMime, mediaStorage } from '../utils/
 import { chatMediaExpiresAt, isChatMediaLive } from '../utils/chatMedia';
 import { areFriends, canSeeContent, connectionSets, describeRelation, follows, loadPair, mutualFriendIds } from '../utils/friendship';
 import { chatIsOpen, ensurePendingChatRequest, wipeDmBothSides } from '../utils/chatAccess';
+import { publicListAvatar } from '../utils/avatarMedia';
 
 const router = express.Router();
 
@@ -139,9 +140,7 @@ router.get(
           name: user.name || (user as any).username || user.email,
           email: user.email,
           username: (user as any).username,
-          avatar:
-            user.avatar ||
-            `https://ui-avatars.com/api/?name=${encodeURIComponent(user.name || (user as any).username || user.email)}`,
+          avatar: publicListAvatar(user.avatar, oid),
           bodyWeight: user.bodyWeight,
           friendshipStatus: rel.status === 'none' ? null : rel.status,
           friendshipDirection: rel.direction,
@@ -201,7 +200,7 @@ router.get('/suggestions', authenticateToken, async (req: Request, res: Response
       name: user.name || user.username || user.email,
       email: user.email,
       username: user.username,
-      avatar: user.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(user.name || user.username || user.email)}`,
+      avatar: publicListAvatar(user.avatar, user._id?.toString?.() || String(user._id || '')),
       bodyWeight: user.bodyWeight,
       friendshipStatus: null,
     }));
@@ -303,9 +302,9 @@ router.get('/friends/:friendId/profile', authenticateToken, async (req: Request,
     res.json({
       id: String(friend._id),
       name: friend.name || 'Usuario',
-      avatar: friend.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(friend.name || 'U')}`,
+      avatar: publicListAvatar(friend.avatar, String(friend._id)),
       bio: friend.bio || '',
-      coach: coach ? { id: String(coach._id), name: coach.name || 'Usuario', avatar: coach.avatar || null } : null,
+      coach: coach ? { id: String(coach._id), name: coach.name || 'Usuario', avatar: publicListAvatar(coach.avatar, String(coach._id)) || null } : null,
       athleteCount,
       trainingMaxes: sharedTms.map((t: any) => ({
         id: String(t._id),
@@ -355,7 +354,7 @@ router.get('/friends', authenticateToken, async (req: Request, res: Response) =>
           id,
           name,
           email: u?.email,
-          avatar: u?.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(name)}`,
+          avatar: publicListAvatar(u?.avatar, id),
         };
       });
 
@@ -377,7 +376,7 @@ function packPeople(
     return {
       id,
       name,
-      avatar: u?.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(name)}`,
+      avatar: publicListAvatar(u?.avatar, id),
       canSendRequest: canSend.has(id),
       kind: kindOf(id),
     };
@@ -440,7 +439,7 @@ router.get('/requests', authenticateToken, async (req: Request, res: Response) =
       id: r._id.toString(),
       userId: (r.requester as any)?._id?.toString?.() || String((r.requester as any)?._id || ''),
       name: (r.requester as any).name || (r.requester as any).email,
-      avatar: (r.requester as any).avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent((r.requester as any).name || (r.requester as any).email)}`,
+      avatar: publicListAvatar((r.requester as any).avatar, (r.requester as any)?._id?.toString?.() || String((r.requester as any)?._id || '')),
       status: r.status,
     }));
 
@@ -559,64 +558,52 @@ router.put('/requests/:id/accept', authenticateToken, async (req: Request, res: 
     }
 
     friendship.status = 'accepted';
-    friendship.followOnly = true;
+    friendship.followOnly = false;
     await friendship.save();
 
-    const nowFriends = await areFriends(String(userId), String(friendship.requester));
-    if (nowFriends) {
-      await Friendship.updateMany(
-        {
-          status: 'accepted',
-          $or: [
-            { requester: userId, recipient: friendship.requester },
-            { requester: friendship.requester, recipient: userId },
-          ],
-        },
-        { $set: { followOnly: false } }
-      );
-    }
+    const requesterId = friendship.requester;
+    await Friendship.findOneAndUpdate(
+      { requester: userId, recipient: requesterId },
+      { $set: { status: 'accepted', followOnly: false } },
+      { upsert: true }
+    );
 
     const currentUser = await User.findById(userId);
-    const requesterUser = await User.findById(friendship.requester).select('name email');
+    const requesterUser = await User.findById(requesterId).select('name email avatar');
     const acceptorName = currentUser?.name || currentUser?.email || 'Alguien';
     const requesterName = requesterUser?.name || requesterUser?.email || 'Alguien';
     await Notification.create({
-      userId: friendship.requester,
+      userId: requesterId,
       type: 'friend_accepted',
       title: `${acceptorName} ha aceptado tu solicitud`,
-      message: nowFriends ? '¡Ahora sois amigos!' : 'Aún no sois amigos: tiene que enviarte solicitud también.',
+      message: '¡Ahora sois amigos!',
       relatedUserId: userId,
-    });
-    await Notification.create({
-      userId,
-      type: 'friend_accepted',
-      title: `${requesterName} ahora te sigue`,
-      message: `${requesterName} ahora te sigue`,
-      relatedUserId: friendship.requester,
-      relatedData: { kind: 'new_follower' },
     });
 
     try {
       const { sendPushToUser } = await import('../utils/push');
       await sendPushToUser(
-        String(friendship.requester),
+        String(requesterId),
         `${acceptorName} ha aceptado tu solicitud`,
-        nowFriends ? '¡Ahora sois amigos!' : 'Aún no sois amigos: envíale tú también la solicitud.',
+        '¡Ahora sois amigos!',
         { type: 'friend_accepted', relatedUserId: String(userId) }
-      );
-      await sendPushToUser(
-        String(userId),
-        `${requesterName} ahora te sigue`,
-        `${requesterName} ahora te sigue`,
-        { type: 'friend_accepted', relatedUserId: String(friendship.requester), kind: 'new_follower' }
       );
     } catch (e) {
       console.error('[PUSH] Error friend_accepted:', e);
     }
 
-    broadcastSse([userId, friendship.requester.toString()], 'social_update');
+    broadcastSse([userId, String(requesterId)], 'social_update');
 
-    res.json(friendship);
+    res.json({
+      id: friendship._id.toString(),
+      status: 'accepted',
+      friends: true,
+      friend: {
+        id: String(requesterId),
+        name: requesterName,
+        avatar: publicListAvatar(requesterUser?.avatar, String(requesterId)),
+      },
+    });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -763,7 +750,7 @@ router.get('/friends/routine-progress', authenticateToken, async (req: Request, 
       const uid = new mongoose.Types.ObjectId(oid);
       const u = userMap.get(oid);
       const name = u?.name || u?.email || 'Usuario';
-      const avatar = u?.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(name)}`;
+      const avatar = publicListAvatar(u?.avatar, oid);
       const stats = await routineImprovementForUser(uid);
       entries.push({
         userId: oid,
@@ -839,11 +826,12 @@ router.get('/users/:userId/profile', authenticateToken, async (req: Request, res
       id: String(target._id),
       name: target.name || 'Usuario',
       username: target.username || null,
-      avatar: target.avatar || null,
+      avatar: publicListAvatar(target.avatar, String(target._id)) || null,
       bio: target.bio || '',
       isSelf,
       isFriend,
       friendshipStatus: isSelf ? 'self' : rel.status,
+      friendshipDirection: isSelf ? null : rel.direction,
       canSendRequest: !isSelf && rel.canSend,
       postCount,
       friendCount,
@@ -854,7 +842,7 @@ router.get('/users/:userId/profile', authenticateToken, async (req: Request, res
       athleteInviteStatus: athleteInvite?.status ?? 'none',
       iAmTheirCoach: !isSelf && String(target.coachId || '') === String(viewerId),
       routineName: activeRoutine?.name ?? null,
-      coach: coach ? { id: String(coach._id), name: coach.name || 'Usuario', avatar: coach.avatar || null } : null,
+      coach: coach ? { id: String(coach._id), name: coach.name || 'Usuario', avatar: publicListAvatar(coach.avatar, String(coach._id)) || null } : null,
       trainingMaxes: trainingMaxes.map((t: any) => ({
         id: String(t._id),
         name: t.name,
@@ -944,10 +932,10 @@ router.get('/me/profile', authenticateToken, async (req: Request, res: Response)
     res.json({
       id: String(me._id),
       name: me.name || 'Usuario',
-      avatar: me.avatar || null,
+      avatar: publicListAvatar(me.avatar, String(me._id)) || null,
       bio: me.bio || '',
-      coach: coach ? { id: String(coach._id), name: coach.name || 'Usuario', avatar: coach.avatar || null } : null,
-      athletes: athletes.map((a: any) => ({ id: String(a._id), name: a.name || 'Usuario', avatar: a.avatar || null })),
+      coach: coach ? { id: String(coach._id), name: coach.name || 'Usuario', avatar: publicListAvatar(coach.avatar, String(coach._id)) || null } : null,
+      athletes: athletes.map((a: any) => ({ id: String(a._id), name: a.name || 'Usuario', avatar: publicListAvatar(a.avatar, String(a._id)) || null })),
     });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
@@ -1179,7 +1167,7 @@ function authorCard(user: { _id: unknown; name?: string; avatar?: string | null 
   return {
     id,
     name: user.name || 'Atleta',
-    avatar: user.avatar || null,
+    avatar: publicListAvatar(user.avatar, id) || null,
     online: isUserOnline(id),
   };
 }
@@ -1423,7 +1411,6 @@ async function notifyChatMessage(opts: {
       console.error('[PUSH] Error chat_message:', e);
     }
   }
-  if (opts.toIds.length) broadcastSse(opts.toIds, 'social_update');
 }
 
 function isGroupMember(group: { members: unknown[] }, userId: string): boolean {
@@ -2076,6 +2063,40 @@ router.put('/chats/chat-requests/:id/reject', authenticateToken, async (req: Req
   }
 });
 
+router.post('/chats/:peerId/read', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const me = String((req as any).user.userId);
+    const peerId = String(req.params.peerId);
+    if (!mongoose.isValidObjectId(peerId) || peerId === me) {
+      return res.status(400).json({ error: 'Chat inválido' });
+    }
+    await ChatMessage.updateMany(
+      { groupId: null, from: peerId, to: me, readAt: null },
+      { $set: { readAt: new Date() } }
+    );
+    res.json({ ok: true });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.post('/chats/groups/:groupId/read', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const me = String((req as any).user.userId);
+    const groupId = String(req.params.groupId);
+    if (!mongoose.isValidObjectId(groupId)) return res.status(400).json({ error: 'Grupo inválido' });
+    const group = await ChatGroup.findById(groupId).lean();
+    if (!group || !isGroupMember(group, me)) return res.status(404).json({ error: 'Grupo no encontrado' });
+    await ChatMessage.updateMany(
+      { groupId, from: { $ne: me }, readBy: { $ne: me } },
+      { $addToSet: { readBy: me } }
+    );
+    res.json({ ok: true });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 router.delete('/chats/:peerId', authenticateToken, async (req: Request, res: Response) => {
   try {
     const me = String((req as any).user.userId);
@@ -2123,6 +2144,11 @@ router.get('/chats/:peerId/messages', authenticateToken, async (req: Request, re
     const messages = await loadDmLines(me, peerId);
     const online = isUserOnline(peerId);
 
+    await ChatMessage.updateMany(
+      { groupId: null, from: peerId, to: me, readAt: null },
+      { $set: { readAt: new Date() } }
+    );
+
     if (outgoing) {
       return res.json({
         waiting: true,
@@ -2150,7 +2176,6 @@ router.get('/chats/:peerId/messages', authenticateToken, async (req: Request, re
     }
 
     if (await chatIsOpen(me, peerId)) {
-      await ChatMessage.updateMany({ groupId: null, from: peerId, to: me, readAt: null }, { $set: { readAt: new Date() } });
       return res.json({
         waiting: false,
         incoming: false,

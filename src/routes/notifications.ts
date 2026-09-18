@@ -7,6 +7,7 @@ import { canSeeContent } from '../utils/friendship';
 import { sendPushToUser } from '../utils/push';
 import { broadcastSse } from '../utils/sse';
 import { getVapidPublicKey, isWebPushConfigured } from '../utils/webPush';
+import { publicListAvatar } from '../utils/avatarMedia';
 
 const router = express.Router();
 
@@ -46,7 +47,7 @@ router.post('/web-push-subscription', authenticateToken, async (req: Request, re
         keys: { p256dh: req.body.keys.p256dh, auth: req.body.keys.auth },
         createdAt: new Date(),
       },
-    ].slice(-8);
+    ].slice(-3);
 
     await User.findByIdAndUpdate(userId, { webPushSubscriptions: next });
     res.json({ message: 'Suscripción registrada' });
@@ -145,37 +146,40 @@ router.post(
         return res.status(403).json({ error: 'Solo puedes avisar a quien sigues' });
       }
 
-      const notification = new Notification({
+      const title = `${fromUserName} se apunta a tu entrenamiento`;
+      const message = `${gymName} a las ${time}`;
+      const recent = await Notification.findOne({
         userId: friendUserId,
         type: 'gym_checkin',
-        title: `${fromUserName} se apunta a tu entrenamiento`,
-        message: `${gymName} a las ${time}`,
         relatedUserId: fromUserId,
-        relatedData: {
-          gymName,
-          time,
-          kind: 'same_time_confirmation',
-        },
-      });
+        createdAt: { $gte: new Date(Date.now() - 90 * 1000) },
+      }).sort({ createdAt: -1 });
 
-      await notification.save();
-
-      // Push al móvil (llega aunque la app esté cerrada)
-      try {
-        await sendPushToUser(
-          String(friendUserId),
-          `${fromUserName} se apunta a tu entrenamiento`,
-          `${gymName} a las ${time}`,
-          {
+      if (recent) {
+        recent.title = title;
+        recent.message = message;
+        recent.relatedData = { gymName, time, kind: 'same_time_confirmation' };
+        await recent.save();
+      } else {
+        await Notification.create({
+          userId: friendUserId,
+          type: 'gym_checkin',
+          title,
+          message,
+          relatedUserId: fromUserId,
+          relatedData: { gymName, time, kind: 'same_time_confirmation' },
+        });
+        try {
+          await sendPushToUser(String(friendUserId), title, message, {
             type: 'gym_checkin',
             relatedUserId: String(fromUserId),
             gymName,
             time,
             kind: 'same_time_confirmation',
-          }
-        );
-      } catch (e) {
-        console.error('[PUSH] Error same-time:', e);
+          });
+        } catch (e) {
+          console.error('[PUSH] Error same-time:', e);
+        }
       }
       broadcastSse([String(friendUserId), String(fromUserId)], 'checkin_update');
 
@@ -218,7 +222,7 @@ router.get('/', authenticateToken, async (req: Request, res: Response) => {
       relatedUserId: n.relatedUserId ? (n.relatedUserId as any)._id.toString() : null,
       relatedUser: n.relatedUserId ? {
         name: (n.relatedUserId as any).name || (n.relatedUserId as any).email,
-        avatar: (n.relatedUserId as any).avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent((n.relatedUserId as any).name || (n.relatedUserId as any).email)}`,
+        avatar: publicListAvatar((n.relatedUserId as any).avatar, (n.relatedUserId as any)._id?.toString?.()),
       } : null,
       relatedData: n.relatedData,
       read: n.read,

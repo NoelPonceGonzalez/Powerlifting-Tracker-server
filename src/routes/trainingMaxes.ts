@@ -249,7 +249,11 @@ router.put(
             await Notification.insertMany(notifications);
             // Sin esto la campana del amigo no se entera hasta que recargue.
             broadcastSse(friendIds, 'social_update');
-            await sendPushToUsers(friendIds, notifTitle, notifMessage, { type: 'new_rm', exerciseName: exName });
+            await sendPushToUsers(friendIds, notifTitle, notifMessage, {
+              type: 'new_rm',
+              exerciseName: exName,
+              relatedUserId: String(userId),
+            });
           } catch (e) {
             console.error('[PUSH] Error new_rm notification:', e);
           }

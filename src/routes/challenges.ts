@@ -16,6 +16,7 @@ import {
 import { participantUserIdString } from '../utils/challengeParticipantUtils';
 import { exerciseLabel, formatChallengeDoc, rankOfParticipant } from '../utils/challengeFormat';
 import { broadcastSse } from '../utils/sse';
+import { publicListAvatar } from '../utils/avatarMedia';
 
 const router = express.Router();
 
@@ -165,7 +166,13 @@ router.post(
             friendIds.map(f => f.toString()),
             notifTitle,
             notifBody,
-            { type: 'challenge_invite', challengeId: challenge._id.toString(), screen: 'social', tab: 'challenges' }
+            {
+              type: 'challenge_invite',
+              challengeId: challenge._id.toString(),
+              relatedUserId: String(userId),
+              screen: 'social',
+              tab: 'challenges',
+            }
           );
         } catch (e) {
           console.error('[PUSH] Error challenge_invite:', e);
@@ -274,7 +281,7 @@ router.put(
         challenge.participants.push({
           userId: userId as any,
           name: user?.name || user?.email || 'Usuario',
-          avatar: user?.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(user?.name || user?.email || 'Usuario')}`,
+          avatar: publicListAvatar(user?.avatar, String(userId)),
           score,
           value,
           lifts: ordered,

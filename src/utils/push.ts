@@ -91,6 +91,19 @@ function buildPushDataPayload(data?: Record<string, any>): Record<string, string
   return out;
 }
 
+/** Misma clave en Expo y Web Push: el sistema sustituye el aviso, no apila otro. */
+export function pushCollapseId(data?: Record<string, any>): string {
+  const type = String(data?.type || 'activity');
+  const extra =
+    data?.relatedUserId ||
+    data?.peerId ||
+    data?.postId ||
+    data?.groupId ||
+    data?.challengeId ||
+    '';
+  return extra ? `${type}:${extra}` : type;
+}
+
 // Receipt checking queue — Expo recomienda verificar recibos 15 min después
 const pendingReceipts: ExpoPushReceiptId[] = [];
 let receiptTimerRunning = false;
@@ -126,6 +139,17 @@ function scheduleReceiptCheck() {
   }, 15 * 60 * 1000); // 15 min (recomendado por Expo)
 }
 
+async function dropDeadExpoTokens(chunk: ExpoPushMessage[], tickets: ExpoPushTicket[]) {
+  const dead: string[] = [];
+  tickets.forEach((ticket, i) => {
+    const err = ticket.status === 'error' ? (ticket as { details?: { error?: string } }).details?.error : '';
+    const to = chunk[i]?.to;
+    if (err === 'DeviceNotRegistered' && typeof to === 'string') dead.push(to);
+  });
+  if (dead.length === 0) return;
+  await User.updateMany({ pushTokens: { $in: dead } }, { $pull: { pushTokens: { $in: dead } } }).catch(() => undefined);
+}
+
 function collectTicketIds(tickets: ExpoPushTicket[]) {
   for (const ticket of tickets) {
     if (ticket.status === 'ok' && ticket.id) {
@@ -156,13 +180,15 @@ export async function sendPushToUser(
         channelId: ANDROID_CHANNEL_ID,
         data: payloadData,
         priority: 'high',
-        ttl: 86400,
+        ttl: 300,
+        collapseId: pushCollapseId(payloadData),
         badge: 1,
       }));
       const chunks = client.chunkPushNotifications(messages);
       for (const chunk of chunks) {
         const tickets = await client.sendPushNotificationsAsync(chunk);
         collectTicketIds(tickets);
+        await dropDeadExpoTokens(chunk, tickets);
         const errors = tickets.filter((t: any) => t?.status === 'error');
         if (errors.length > 0) {
           console.error('[PUSH] Error ticket para', userId, errors.map((e: any) => (e as any).message));
@@ -170,13 +196,15 @@ export async function sendPushToUser(
           console.log('[PUSH] Enviado a', userId, `(${tokens.length} disp.):`, title);
         }
       }
-    } else if (!user?.webPushSubscriptions?.length) {
-      console.warn('[PUSH] Usuario sin token Expo ni Web Push:', userId);
+      return;
     }
 
-    if (user) {
+    if (user?.webPushSubscriptions?.length) {
       await sendWebPushToUser(userId, user, title, body, payloadData);
+      return;
     }
+
+    console.warn('[PUSH] Usuario sin token Expo ni Web Push:', userId);
   } catch (err) {
     console.error('[PUSH] Error enviando a usuario', userId, err);
   }
@@ -219,13 +247,15 @@ export async function sendPushToUsers(
         channelId: ANDROID_CHANNEL_ID,
         data: payloadData,
         priority: 'high' as const,
-        ttl: 86400,
+        ttl: 300,
+        collapseId: pushCollapseId(payloadData),
         badge: 1,
       }));
       const chunks = client.chunkPushNotifications(messages);
       for (const chunk of chunks) {
         const tickets = await client.sendPushNotificationsAsync(chunk);
         collectTicketIds(tickets);
+        await dropDeadExpoTokens(chunk, tickets);
         const errors = tickets.filter((t: any) => t?.status === 'error');
         if (errors.length > 0) {
           console.error('[PUSH] Errores en envío:', errors.map((e: any) => ({ msg: (e as any).message, details: (e as any).details })));
@@ -238,7 +268,8 @@ export async function sendPushToUsers(
     }
   }
 
+  const webOnly = users.filter((u) => collectValidExpoTokens(u).length === 0);
   await Promise.all(
-    users.map((u) => sendWebPushToUser(String(u._id), u, title, body, payloadData))
+    webOnly.map((u) => sendWebPushToUser(String(u._id), u, title, body, payloadData))
   );
 }

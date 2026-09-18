@@ -3,7 +3,7 @@ import multer from 'multer';
 import { body, validationResult } from 'express-validator';
 import { User } from '../models/User';
 import { PendingSignup, IPendingSignup } from '../models/PendingSignup';
-import { sendVerificationEmail } from '../utils/email';
+import { sendVerificationEmail, sendPasswordResetEmail } from '../utils/email';
 import { hashPassword, comparePassword } from '../utils/crypto';
 import { generateToken, authenticateToken, AuthRequest } from '../middleware/auth';
 import { logger } from '../utils/logger';
@@ -11,6 +11,7 @@ import { config, getPublicWebBaseUrl } from '../config/env';
 import {
   isInlineAvatar,
   publicAvatarRef,
+  publicListAvatar,
   resolveIncomingAvatar,
   saveAvatarBuffer,
   saveAvatarDataUrl,
@@ -93,15 +94,19 @@ router.post(
 
       const { email } = req.body;
 
-      // Cuenta ya completada en User (contraseña fijada)
-      const existingUser = await User.findOne({ email });
-      if (existingUser?.password) {
-        return res.status(400).json({ error: 'Este email ya está registrado' });
+      const existingCompleted = await User.findOne({
+        email,
+        password: { $exists: true, $nin: [null, ''] },
+      });
+      if (existingCompleted) {
+        return res.status(400).json({
+          error: 'Este email ya está registrado. Entra o recupera la contraseña.',
+        });
       }
-      // Huérfano antiguo: documento User sin contraseña (flujo previo) — quitar para liberar email
-      if (existingUser && !existingUser.password) {
-        await User.findByIdAndDelete(existingUser._id);
-      }
+      await User.deleteMany({
+        email,
+        $or: [{ password: { $exists: false } }, { password: null }, { password: '' }],
+      });
 
       const verificationToken = generateNumericVerificationCode();
       const verificationTokenExpires = new Date(Date.now() + 24 * 60 * 60 * 1000);
@@ -151,10 +156,16 @@ router.post(
         });
       }
 
+      // Sin SMTP el código no llega al correo: el navegador necesita el token
+      // para completar el registro (si no, el amigo se queda esperando un email).
       res.status(201).json({
-        message: 'Código de verificación enviado. Revisa tu bandeja de entrada.',
+        message: config.email.enabled
+          ? 'Código de verificación enviado. Revisa tu bandeja de entrada.'
+          : 'Introduce tus datos para completar la cuenta. El correo no está configurado en este servidor.',
         requiresVerification: true,
         requiresCode: true,
+        emailSent: config.email.enabled,
+        ...(!config.email.enabled ? { token: verificationToken } : {}),
       });
     } catch (error: any) {
       logger.error('Error en registro', error);
@@ -255,8 +266,12 @@ router.get(
       const webFormUrl = webBase
         ? `${webBase}/api/auth/verify-email?token=${encodeURIComponent(token)}&web=1`
         : mobileUrl;
-      // Por defecto abrimos la app; con ?web=1 se fuerza el formulario web clásico.
-      if (String(req.query.web || '') !== '1') return res.send(`
+      const ua = String(req.headers['user-agent'] || '');
+      const isMobileUa = /android|iphone|ipad|ipod|mobile/i.test(ua);
+      // En el navegador de escritorio no tiene sentido abrir el deep link de la app:
+      // el amigo se quedaba en «Abriendo la app…» y no podía terminar el registro.
+      const forceMobileGate = String(req.query.web || '') !== '1' && isMobileUa;
+      if (forceMobileGate) return res.send(`
         <!DOCTYPE html>
         <html lang="es">
           <head>
@@ -608,13 +623,20 @@ router.post(
       }
 
       const email = pending.email.trim().toLowerCase();
+      await User.deleteMany({
+        email,
+        $or: [{ password: { $exists: false } }, { password: null }, { password: '' }],
+      });
+
       const already = await User.findOne({
         email,
         password: { $exists: true, $nin: [null, ''] },
       });
       if (already) {
         await PendingSignup.deleteOne({ _id: pending._id });
-        return res.status(400).json({ error: 'Este email ya está registrado' });
+        return res.status(400).json({
+          error: 'Este email ya está registrado. Entra o recupera la contraseña.',
+        });
       }
 
       const hashedPassword = await hashPassword(password);
@@ -630,16 +652,27 @@ router.post(
         throw new Error('Error al generar nombre de usuario único');
       }
 
-      const user = new User({
-        email,
-        name: name.trim(),
-        username: uniqueUsername.trim(),
-        bodyWeight: Number(bodyWeight),
-        password: hashedPassword,
-        gender,
-        emailVerified: true,
-        avatar,
-      });
+      let user = await User.findOne({ email });
+      if (user) {
+        user.name = name.trim();
+        user.username = uniqueUsername.trim();
+        user.bodyWeight = Number(bodyWeight);
+        user.password = hashedPassword;
+        user.gender = gender;
+        user.emailVerified = true;
+        if (avatar) user.avatar = avatar;
+      } else {
+        user = new User({
+          email,
+          name: name.trim(),
+          username: uniqueUsername.trim(),
+          bodyWeight: Number(bodyWeight),
+          password: hashedPassword,
+          gender,
+          emailVerified: true,
+          avatar,
+        });
+      }
 
       const validationError = user.validateSync();
       if (validationError) {
@@ -649,7 +682,17 @@ router.post(
         );
       }
 
-      await user.save();
+      try {
+        await user.save();
+      } catch (saveErr: any) {
+        if (saveErr?.code === 11000) {
+          await PendingSignup.deleteOne({ _id: pending._id });
+          return res.status(400).json({
+            error: 'Este email ya está registrado. Entra o recupera la contraseña.',
+          });
+        }
+        throw saveErr;
+      }
       await PendingSignup.deleteOne({ _id: pending._id });
 
       // Generar token JWT
@@ -665,7 +708,7 @@ router.post(
           name: user.name,
           gender: user.gender,
           bodyWeight: user.bodyWeight,
-          avatar: user.avatar || '',
+          avatar: publicListAvatar(user.avatar, user._id.toString()),
           theme: user.theme ?? undefined,
           progressMode: user.progressMode ?? undefined,
           mbMode: !!user.mbMode,
@@ -680,7 +723,9 @@ router.post(
       } else if (error.name === 'ValidationError') {
         errorMessage = 'Error de validación: ' + Object.values(error.errors || {}).map((e: any) => e.message).join(', ');
       } else if (error.code === 11000) {
-        errorMessage = 'El nombre de usuario ya está en uso';
+        errorMessage = String(error.message || '').includes('email')
+          ? 'Este email ya está registrado. Entra o recupera la contraseña.'
+          : 'El nombre de usuario ya está en uso';
       }
       
       res.status(500).json({ 
@@ -829,34 +874,7 @@ router.post(
 
       logger.info('POST /login - Login exitoso', { userId: user._id.toString(), username: user.username });
 
-      const [avatarMeta] = await User.aggregate<{ prefix: string; avatar: string }>([
-        { $match: { _id: user._id } },
-        {
-          $project: {
-            prefix: { $substrBytes: [{ $ifNull: ['$avatar', ''] }, 0, 11] },
-            avatar: {
-              $cond: [
-                {
-                  $lt: [{ $strLenBytes: { $ifNull: ['$avatar', ''] } }, 400],
-                },
-                { $ifNull: ['$avatar', ''] },
-                '',
-              ],
-            },
-          },
-        },
-      ]);
-      let avatar = publicAvatarRef(avatarMeta?.avatar);
-      if (avatarMeta?.prefix?.startsWith('data:')) {
-        void User.findById(user._id)
-          .select('avatar')
-          .then(async (row) => {
-            if (!row || !isInlineAvatar(row.avatar)) return;
-            const key = await saveAvatarDataUrl(String(row.avatar));
-            await User.updateOne({ _id: row._id }, { $set: { avatar: key } });
-          })
-          .catch((err) => logger.warn('[avatar] Migración en login omitida', err));
-      }
+      const avatar = await publicUserAvatar(user._id);
       
       res.json({
         message: 'Login exitoso',
@@ -915,32 +933,7 @@ router.get('/me', authenticateToken, async (req: AuthRequest, res: Response) => 
       return res.status(404).json({ error: 'Usuario no encontrado' });
     }
 
-    const [avatarMeta] = await User.aggregate<{ prefix: string; avatar: string }>([
-      { $match: { _id: user._id } },
-      {
-        $project: {
-          prefix: { $substrBytes: [{ $ifNull: ['$avatar', ''] }, 0, 11] },
-          avatar: {
-            $cond: [
-              { $lt: [{ $strLenBytes: { $ifNull: ['$avatar', ''] } }, 400] },
-              { $ifNull: ['$avatar', ''] },
-              '',
-            ],
-          },
-        },
-      },
-    ]);
-    let avatar = publicAvatarRef(avatarMeta?.avatar);
-    if (avatarMeta?.prefix?.startsWith('data:')) {
-      void User.findById(user._id)
-        .select('avatar')
-        .then(async (row) => {
-          if (!row || !isInlineAvatar(row.avatar)) return;
-          const key = await saveAvatarDataUrl(String(row.avatar));
-          await User.updateOne({ _id: row._id }, { $set: { avatar: key } });
-        })
-        .catch((err) => logger.warn('[avatar] Migración en /me omitida', err));
-    }
+    const avatar = await publicUserAvatar(user._id);
 
     res.json({ 
       user: {
@@ -1031,24 +1024,7 @@ router.put('/me', authenticateToken, async (req: AuthRequest, res: Response) => 
       user.mbMode = !!mbMode;
     }
     await user.save();
-    let avatarOut = publicAvatarRef(user.avatar);
-    if (avatar === undefined) {
-      const [m] = await User.aggregate<{ avatar: string }>([
-        { $match: { _id: user._id } },
-        {
-          $project: {
-            avatar: {
-              $cond: [
-                { $lt: [{ $strLenBytes: { $ifNull: ['$avatar', ''] } }, 400] },
-                { $ifNull: ['$avatar', ''] },
-                '',
-              ],
-            },
-          },
-        },
-      ]);
-      avatarOut = publicAvatarRef(m?.avatar);
-    }
+    const avatarOut = await publicUserAvatar(user._id);
     res.json({
       user: {
         id: user._id.toString(),
@@ -1069,6 +1045,176 @@ router.put('/me', authenticateToken, async (req: AuthRequest, res: Response) => 
     res.status(500).json({ error: 'Error al actualizar el usuario' });
   }
 });
+
+function loginUserPayload(
+  user: { _id: unknown; email?: string; username?: string; name?: string; gender?: string; bodyWeight?: number; theme?: string; progressMode?: string; mbMode?: boolean },
+  avatar: string
+) {
+  return {
+    id: String(user._id),
+    email: user.email,
+    username: user.username,
+    name: user.name,
+    gender: user.gender,
+    bodyWeight: user.bodyWeight,
+    avatar,
+    theme: user.theme ?? undefined,
+    progressMode: user.progressMode ?? undefined,
+    mbMode: !!user.mbMode,
+  };
+}
+
+async function publicUserAvatar(userId: unknown): Promise<string> {
+  const row = await User.findById(userId).select('avatar').lean();
+  const raw = String(row?.avatar || '').trim();
+  if (isInlineAvatar(raw)) {
+    try {
+      const key = await saveAvatarDataUrl(raw);
+      await User.updateOne({ _id: userId }, { $set: { avatar: key } });
+      return publicListAvatar(key, String(userId));
+    } catch (err) {
+      logger.warn('[avatar] Migración omitida', err);
+      return publicListAvatar(raw, String(userId));
+    }
+  }
+  return publicListAvatar(raw, String(userId));
+}
+
+router.post(
+  '/forgot-password',
+  [
+    body('email')
+      .trim()
+      .customSanitizer((value) => normalizeEmailInput(value))
+      .isEmail()
+      .withMessage('Email inválido'),
+  ],
+  async (req: Request, res: Response) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ errors: errors.array() });
+      }
+      const email = String(req.body.email || '').trim().toLowerCase();
+      const user = await User.findOne({
+        email,
+        password: { $exists: true, $nin: [null, ''] },
+      }).select('_id email');
+
+      if (user) {
+        const resetCode = generateNumericVerificationCode();
+        await User.updateOne(
+          { _id: user._id },
+          {
+            $set: {
+              resetPasswordToken: resetCode,
+              resetPasswordExpires: new Date(Date.now() + 15 * 60 * 1000),
+            },
+          }
+        );
+        await sendPasswordResetEmail(email, resetCode);
+      }
+
+      return res.json({
+        ok: true,
+        message: 'Si el correo está registrado, te hemos enviado un código.',
+      });
+    } catch (error: any) {
+      logger.error('Error en forgot-password', error);
+      return res.status(500).json({ error: 'No se pudo enviar el código. Inténtalo de nuevo.' });
+    }
+  }
+);
+
+router.post(
+  '/verify-reset-code',
+  [
+    body('email')
+      .trim()
+      .customSanitizer((value) => normalizeEmailInput(value))
+      .isEmail()
+      .withMessage('Email inválido'),
+    body('code')
+      .trim()
+      .matches(/^\d{6}$/)
+      .withMessage('Código inválido'),
+  ],
+  async (req: Request, res: Response) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ errors: errors.array() });
+      }
+      const email = String(req.body.email || '').trim().toLowerCase();
+      const code = String(req.body.code || '').trim();
+      const user = await User.findOne({
+        email,
+        resetPasswordToken: code,
+        resetPasswordExpires: { $gt: new Date() },
+      }).select('_id');
+      if (!user) {
+        return res.status(400).json({ error: 'Código inválido o expirado' });
+      }
+      return res.json({ ok: true, message: 'Código verificado' });
+    } catch (error: any) {
+      logger.error('Error verificando código de recuperación', error);
+      return res.status(500).json({ error: 'No se pudo verificar el código' });
+    }
+  }
+);
+
+router.post(
+  '/reset-password',
+  [
+    body('email')
+      .trim()
+      .customSanitizer((value) => normalizeEmailInput(value))
+      .isEmail()
+      .withMessage('Email inválido'),
+    body('code')
+      .trim()
+      .matches(/^\d{6}$/)
+      .withMessage('Código inválido'),
+    body('password').isLength({ min: 6 }).withMessage('La contraseña debe tener al menos 6 caracteres'),
+  ],
+  async (req: Request, res: Response) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ errors: errors.array() });
+      }
+      const email = String(req.body.email || '').trim().toLowerCase();
+      const code = String(req.body.code || '').trim();
+      const password = String(req.body.password || '');
+
+      const user = await User.findOne({
+        email,
+        resetPasswordToken: code,
+        resetPasswordExpires: { $gt: new Date() },
+      }).select('email username name gender bodyWeight theme progressMode mbMode');
+
+      if (!user) {
+        return res.status(400).json({ error: 'Código inválido o expirado' });
+      }
+
+      user.password = await hashPassword(password);
+      user.resetPasswordToken = undefined;
+      user.resetPasswordExpires = undefined;
+      await user.save();
+
+      const jwtToken = generateToken(user._id.toString(), user.email);
+      const avatar = await publicUserAvatar(user._id);
+      return res.json({
+        message: 'Contraseña actualizada',
+        token: jwtToken,
+        user: loginUserPayload(user, avatar),
+      });
+    } catch (error: any) {
+      logger.error('Error en reset-password', error);
+      return res.status(500).json({ error: 'No se pudo cambiar la contraseña' });
+    }
+  }
+);
 
 router.post(
   '/me/avatar',

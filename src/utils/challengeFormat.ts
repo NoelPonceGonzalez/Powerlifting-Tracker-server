@@ -4,6 +4,7 @@ import {
   normalizeChallengeExercises,
 } from './challengeScoring';
 import { getBodyWeightAndGenderFromParticipant, participantUserIdString } from './challengeParticipantUtils';
+import { publicListAvatar } from './avatarMedia';
 
 export function rankOfParticipant(
   participants: Array<{ userId: unknown; score: number; value: number }>,
@@ -60,7 +61,10 @@ export function formatChallengeDoc(c: any) {
     createdBy: {
       id: String((c.createdBy as any)?._id || (c.createdBy as any)?.id || c.createdBy),
       name: (c.createdBy as any)?.name || (c.createdBy as any)?.email || 'Alguien',
-      avatar: (c.createdBy as any)?.avatar,
+      avatar: publicListAvatar(
+        (c.createdBy as any)?.avatar,
+        String((c.createdBy as any)?._id || (c.createdBy as any)?.id || '')
+      ) || null,
     },
   };
 }

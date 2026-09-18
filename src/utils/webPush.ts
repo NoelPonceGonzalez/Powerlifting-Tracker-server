@@ -73,10 +73,15 @@ export async function sendWebPushToUser(
   const subs = usableSubs(user);
   if (subs.length === 0) return;
 
+  const tag =
+    data?.relatedUserId || data?.peerId || data?.postId || data?.groupId || data?.challengeId
+      ? `${data?.type || 'activity'}:${data.relatedUserId || data.peerId || data.postId || data.groupId || data.challengeId}`
+      : data?.type || 'activity';
+
   const payload = JSON.stringify({
     title,
     body,
-    tag: data?.type || 'activity',
+    tag,
     url: urlFromPayload(data),
     screen: data?.screen,
     tab: data?.tab,
@@ -94,7 +99,7 @@ export async function sendWebPushToUser(
             keys: { p256dh: sub.keys!.p256dh!, auth: sub.keys!.auth! },
           },
           payload,
-          { TTL: 86400, urgency: 'high' }
+          { TTL: 300, urgency: 'high' }
         );
         sent += 1;
       } catch (err: any) {
