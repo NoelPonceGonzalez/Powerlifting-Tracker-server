@@ -1230,10 +1230,9 @@ async function liveStoryLookup(rows: Array<{ storyReply?: StoryReplySnap }>) {
   }
   const byKey = new Map<string, LiveStoryMedia>();
   if (postIds.length === 0 && mediaKeys.length === 0) return byKey;
-  const clauses = [
-    postIds.length ? { _id: { $in: [...new Set(postIds)] } } : null,
-    mediaKeys.length ? { mediaKey: { $in: [...new Set(mediaKeys)] } } : null,
-  ].filter(Boolean);
+  const clauses: Array<{ _id?: { $in: string[] }; mediaKey?: { $in: string[] } }> = [];
+  if (postIds.length) clauses.push({ _id: { $in: [...new Set(postIds)] } });
+  if (mediaKeys.length) clauses.push({ mediaKey: { $in: [...new Set(mediaKeys)] } });
   const posts = await Post.find({ $or: clauses })
     .select('_id mediaKey mediaType')
     .lean();
@@ -1972,7 +1971,7 @@ router.get('/chats/groups/:groupId/messages', authenticateToken, async (req: Req
           row,
           me,
           author ? authorCard(author) : { id: String(row.from), name: 'Atleta', avatar: null, online: false },
-          liveStoryMedia(row.storyReply, liveStories)
+          liveStoryMedia(row.storyReply ?? null, liveStories)
         );
       }),
     });
@@ -2110,7 +2109,9 @@ async function loadDmLines(me: string, peerId: string) {
     .limit(200)
     .lean();
   const liveStories = await liveStoryLookup(rows);
-  return rows.map(row => serializeChatLine(row, me, undefined, liveStoryMedia(row.storyReply, liveStories)));
+  return rows.map(row =>
+    serializeChatLine(row, me, undefined, liveStoryMedia(row.storyReply ?? null, liveStories))
+  );
 }
 
 router.get('/chats/:peerId/messages', authenticateToken, async (req: Request, res: Response) => {
