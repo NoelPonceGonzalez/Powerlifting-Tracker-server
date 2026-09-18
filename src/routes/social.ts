@@ -501,8 +501,8 @@ router.post(
       const notification = new Notification({
         userId: recipientId,
         type: 'friend_request',
-        title: `${requesterName} quiere ser tu amigo`,
-        message: 'Toca para ver la solicitud',
+        title: `${requesterName} te ha enviado una solicitud`,
+        message: 'Toca para ver la solicitud de seguimiento',
         relatedUserId: requesterId,
       });
 
@@ -512,8 +512,8 @@ router.post(
         const { sendPushToUser } = await import('../utils/push');
         await sendPushToUser(
           String(recipientId),
-          `${requesterName} quiere ser tu amigo`,
-          'Toca para ver la solicitud',
+          `${requesterName} te ha enviado una solicitud`,
+          'Toca para ver la solicitud de seguimiento',
           { type: 'friend_request', relatedUserId: String(requesterId) }
         );
       } catch (e) {
@@ -1295,6 +1295,7 @@ async function notifyChatMessage(opts: {
   const preview = (opts.preview || '').trim().slice(0, 80) || (opts.groupId ? 'Foto o vídeo en el grupo' : 'Te ha enviado un mensaje');
   const title = opts.groupId ? `${name} en el grupo` : `${name} te ha escrito`;
   const since = new Date(Date.now() - 10 * 60 * 1000);
+  const pushTargets: string[] = [];
   for (const toId of opts.toIds) {
     const recent = await Notification.findOne({
       userId: toId,
@@ -1308,16 +1309,30 @@ async function notifyChatMessage(opts: {
       recent.message = preview;
       recent.relatedData = opts.groupId ? { groupId: opts.groupId, peerId: opts.fromId } : { peerId: opts.fromId };
       await recent.save().catch(() => {});
-      continue;
+    } else {
+      await Notification.create({
+        userId: toId,
+        type: 'chat_message',
+        title,
+        message: preview,
+        relatedUserId: opts.fromId,
+        relatedData: opts.groupId ? { groupId: opts.groupId, peerId: opts.fromId } : { peerId: opts.fromId },
+      }).catch(() => {});
     }
-    await Notification.create({
-      userId: toId,
-      type: 'chat_message',
-      title,
-      message: preview,
-      relatedUserId: opts.fromId,
-      relatedData: opts.groupId ? { groupId: opts.groupId, peerId: opts.fromId } : { peerId: opts.fromId },
-    }).catch(() => {});
+    pushTargets.push(toId);
+  }
+  if (pushTargets.length) {
+    try {
+      const { sendPushToUsers } = await import('../utils/push');
+      await sendPushToUsers(pushTargets, title, preview, {
+        type: 'chat_message',
+        screen: 'social',
+        tab: 'chat',
+        ...(opts.groupId ? { groupId: opts.groupId } : { peerId: opts.fromId }),
+      });
+    } catch (e) {
+      console.error('[PUSH] Error chat_message:', e);
+    }
   }
   if (opts.toIds.length) broadcastSse(opts.toIds, 'social_update');
 }

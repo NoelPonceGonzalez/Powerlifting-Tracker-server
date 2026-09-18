@@ -151,26 +151,90 @@ export function computeChallengeScore(
   }
 }
 
+export function normalizeChallengeExercises(exercise?: string, exercises?: unknown): string[] {
+  if (Array.isArray(exercises)) {
+    const list = exercises.map((e) => String(e || '').trim()).filter(Boolean);
+    if (list.length > 0) return [...new Set(list)];
+  }
+  const one = String(exercise || '').trim();
+  if (!one) return [];
+  return [...new Set(one.split(/\s*[·|,]\s*/).map((s) => s.trim()).filter(Boolean))];
+}
+
+export function isSbdExerciseSet(exercises: string[]): boolean {
+  if (exercises.length < 3) return false;
+  const n = exercises.map((e) => e.toLowerCase());
+  const squat = n.some((e) => /sentadilla|squat/.test(e));
+  const bench = n.some((e) => /banca|bench/.test(e));
+  const dead = n.some((e) => /muerto|deadlift/.test(e));
+  return squat && bench && dead;
+}
+
+export function computeMultiLiftScore(
+  type: ChallengeScoreType,
+  lifts: { exercise: string; value: number }[],
+  bodyWeight: number,
+  gender: Gender | undefined,
+  usePointsSystem: boolean,
+  bodyWeightScoring: BodyWeightScoringMode = 'heavier_more'
+): { value: number; score: number } {
+  const clean = lifts
+    .map((l) => ({ exercise: String(l.exercise || '').trim(), value: Number(l.value) }))
+    .filter((l) => l.exercise && Number.isFinite(l.value));
+  const value = Math.round(clean.reduce((s, l) => s + l.value, 0) * 1000) / 1000;
+  if (clean.length === 0) return { value: 0, score: 0 };
+
+  if (
+    type === 'weight' &&
+    usePointsSystem &&
+    isSbdExerciseSet(clean.map((l) => l.exercise))
+  ) {
+    return {
+      value,
+      score: computeChallengeScore(type, value, bodyWeight, gender, 'powerlifting total', true, bodyWeightScoring),
+    };
+  }
+
+  const score = clean.reduce(
+    (s, l) => s + computeChallengeScore(type, l.value, bodyWeight, gender, l.exercise, usePointsSystem, bodyWeightScoring),
+    0
+  );
+  return { value, score: Math.round(score * 100) / 100 };
+}
+
 /** Misma lógica que el ranking en la API (puntos o marca bruta según usePointsSystem). */
 export function computeDisplayScoreForChallengeParticipant(
   challenge: {
     type: ChallengeScoreType | string;
     exercise: string;
+    exercises?: string[];
     usePointsSystem?: boolean;
     bodyWeightScoring?: unknown;
   },
   value: number,
   bodyWeight: number,
-  gender: Gender | undefined
+  gender: Gender | undefined,
+  lifts?: { exercise: string; value: number }[] | null
 ): number {
   const usePts = challenge.usePointsSystem !== false;
   const bwMode = normalizeBodyWeightScoring(challenge.bodyWeightScoring);
+  const names = normalizeChallengeExercises(challenge.exercise, challenge.exercises);
+  if (lifts && lifts.length > 0 && (lifts.length > 1 || names.length > 1)) {
+    return computeMultiLiftScore(
+      challenge.type as ChallengeScoreType,
+      lifts,
+      bodyWeight,
+      gender,
+      usePts,
+      bwMode
+    ).score;
+  }
   return computeChallengeScore(
     challenge.type as ChallengeScoreType,
     value,
     bodyWeight,
     gender,
-    challenge.exercise,
+    names[0] || challenge.exercise,
     usePts,
     bwMode
   );

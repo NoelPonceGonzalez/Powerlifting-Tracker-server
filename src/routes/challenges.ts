@@ -1,5 +1,6 @@
 import express, { Request, Response } from 'express';
 import mongoose from 'mongoose';
+import bcrypt from 'bcryptjs';
 import { authenticateToken } from '../middleware/auth';
 import { Challenge } from '../models/Challenge';
 import { Friendship } from '../models/Friendship';
@@ -7,35 +8,16 @@ import { User } from '../models/User';
 import { Notification } from '../models/Notification';
 import { body, validationResult } from 'express-validator';
 import {
-  computeChallengeScore,
-  computeDisplayScoreForChallengeParticipant,
+  computeMultiLiftScore,
   normalizeBodyWeightScoring,
+  normalizeChallengeExercises,
   type ChallengeScoreType,
-  type Gender,
 } from '../utils/challengeScoring';
-import { getBodyWeightAndGenderFromParticipant, participantUserIdString } from '../utils/challengeParticipantUtils';
+import { participantUserIdString } from '../utils/challengeParticipantUtils';
+import { exerciseLabel, formatChallengeDoc, rankOfParticipant } from '../utils/challengeFormat';
 import { broadcastSse } from '../utils/sse';
 
 const router = express.Router();
-
-function displayScoreForParticipant(
-  challenge: { type: string; exercise: string; usePointsSystem?: boolean; bodyWeightScoring?: string },
-  p: { value: number },
-  bodyWeight: number,
-  gender?: Gender
-): number {
-  return computeDisplayScoreForChallengeParticipant(
-    {
-      type: challenge.type as ChallengeScoreType,
-      exercise: challenge.exercise,
-      usePointsSystem: challenge.usePointsSystem,
-      bodyWeightScoring: challenge.bodyWeightScoring,
-    },
-    p.value,
-    bodyWeight,
-    gender
-  );
-}
 
 /** Obtiene los ObjectIds de amigos de un usuario */
 async function getFriendIds(userId: string): Promise<mongoose.Types.ObjectId[]> {
@@ -72,6 +54,7 @@ router.get('/', authenticateToken, async (req: Request, res: Response) => {
         $or: [
           { title: { $regex: q, $options: 'i' } },
           { exercise: { $regex: q, $options: 'i' } },
+          { exercises: { $elemMatch: { $regex: q, $options: 'i' } } },
           { description: { $regex: q, $options: 'i' } },
         ],
       });
@@ -82,43 +65,20 @@ router.get('/', authenticateToken, async (req: Request, res: Response) => {
       .populate('participants.userId', 'name email avatar bodyWeight gender')
       .sort({ endDate: 1 });
 
-    const formatted = challenges.map(c => {
-      const isFinished = c.endDate <= now;
-      const createdAt = (c as { createdAt?: Date }).createdAt;
-      return {
-        id: c._id.toString(),
-        title: c.title,
-        description: c.description || '',
-        type: c.type,
-        exercise: c.exercise,
-        usePointsSystem: c.usePointsSystem !== false,
-        bodyWeightScoring: normalizeBodyWeightScoring(c.bodyWeightScoring),
-        createdAt: createdAt ? new Date(createdAt).toISOString() : undefined,
-        participants: c.participants.map(p => {
-          const { bodyWeight, gender } = getBodyWeightAndGenderFromParticipant(p);
-          const populatedUser = p.userId as any;
-          const avatar = p.avatar || populatedUser?.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(p.name || populatedUser?.name || 'U')}`;
-          return {
-            userId: participantUserIdString(p),
-            name: p.name,
-            avatar,
-            score: displayScoreForParticipant(c, p, bodyWeight, gender),
-            value: p.value,
-            initialValue: p.initialValue,
-            initialScore: p.initialScore,
-            joinedAt: p.joinedAt,
-          };
-        }),
-        endDate: c.endDate,
-        status: isFinished ? 'finished' : 'active',
-        createdBy: {
-          id: (c.createdBy as any)._id.toString(),
-          name: (c.createdBy as any).name || (c.createdBy as any).email,
-        },
-      };
-    });
+    for (const c of challenges) {
+      let dirty = false;
+      for (const p of c.participants) {
+        if (p.initialRank != null || !(p.value > 0)) continue;
+        const rank = rankOfParticipant(c.participants, participantUserIdString(p), c.usePointsSystem);
+        if (rank > 0) {
+          p.initialRank = rank;
+          dirty = true;
+        }
+      }
+      if (dirty) void c.save();
+    }
 
-    res.json(formatted);
+    res.json(challenges.map((c) => formatChallengeDoc(c)));
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -131,7 +91,6 @@ router.post(
   [
     body('title').trim().notEmpty().withMessage('El título es requerido'),
     body('type').isIn(['max_reps', 'weight', 'seconds']).withMessage('Tipo inválido: max_reps, weight o seconds'),
-    body('exercise').trim().notEmpty().withMessage('El ejercicio es requerido'),
     body('endDate').isISO8601().withMessage('La fecha de fin debe ser válida'),
   ],
   async (req: Request, res: Response) => {
@@ -143,6 +102,19 @@ router.post(
 
       const userId = (req as any).user.userId;
       const { title, type, exercise, endDate, description } = req.body;
+      const exercises = normalizeChallengeExercises(exercise, req.body.exercises);
+      if (exercises.length === 0) {
+        return res.status(400).json({ error: 'Añade al menos un ejercicio' });
+      }
+      if (exercises.length > 8) {
+        return res.status(400).json({ error: 'Máximo 8 ejercicios por torneo' });
+      }
+      const exerciseText = exerciseLabel(exercise, exercises);
+      const isPrivate = req.body.isPrivate === true || req.body.isPrivate === 'true';
+      const rawPassword = typeof req.body.password === 'string' ? req.body.password.trim() : '';
+      if (isPrivate && rawPassword.length < 4) {
+        return res.status(400).json({ error: 'La contraseña del torneo privado debe tener al menos 4 caracteres' });
+      }
       const usePointsSystem =
         req.body.usePointsSystem !== false && req.body.usePointsSystem !== 'false';
       const bodyWeightScoring = normalizeBodyWeightScoring(req.body.bodyWeightScoring);
@@ -156,7 +128,10 @@ router.post(
         title,
         description: description || '',
         type,
-        exercise,
+        exercise: exerciseText,
+        exercises,
+        isPrivate,
+        passwordHash: isPrivate ? await bcrypt.hash(rawPassword, 10) : '',
         usePointsSystem,
         bodyWeightScoring,
         endDate: new Date(endDate),
@@ -166,6 +141,7 @@ router.post(
           avatar: creatorAvatar,
           score: 0,
           value: 0,
+          lifts: exercises.map((name) => ({ exercise: name, value: 0 })),
           initialValue: 0,
           initialScore: 0,
           joinedAt: new Date(),
@@ -175,23 +151,27 @@ router.post(
       await challenge.save();
 
       const friendIds = await getFriendIds(userId);
+      const notifTitle = isPrivate ? 'Torneo privado' : 'Nuevo torneo creado';
+      const notifBody = isPrivate
+        ? `${creatorName} ha creado «${title}». Pídele la contraseña para unirte.`
+        : `${creatorName} ha creado «${title}» (${exerciseText})`;
       if (friendIds.length > 0) {
         const notifications = friendIds.map(fid => ({
           userId: fid,
           type: 'challenge_invite' as const,
-          title: 'Nuevo torneo creado',
-          message: `${creatorName} ha creado el torneo "${title}" (${exercise})`,
+          title: notifTitle,
+          message: notifBody,
           relatedUserId: userId,
-          relatedData: { challengeId: challenge._id.toString(), title, exercise },
+          relatedData: { challengeId: challenge._id.toString(), title, exercise: exerciseText, isPrivate },
         }));
         await Notification.insertMany(notifications);
         try {
           const { sendPushToUsers } = await import('../utils/push');
           await sendPushToUsers(
             friendIds.map(f => f.toString()),
-            'Nuevo torneo creado',
-            `${creatorName} ha creado el torneo "${title}" (${exercise})`,
-            { type: 'challenge_invite', challengeId: challenge._id.toString() }
+            notifTitle,
+            notifBody,
+            { type: 'challenge_invite', challengeId: challenge._id.toString(), screen: 'social', tab: 'challenges' }
           );
         } catch (e) {
           console.error('[PUSH] Error challenge_invite:', e);
@@ -204,39 +184,7 @@ router.post(
         .populate('createdBy', 'name email avatar')
         .populate('participants.userId', 'name email avatar bodyWeight gender');
 
-      const participantsFormatted = created!.participants.map((p: any) => {
-        const { bodyWeight, gender } = getBodyWeightAndGenderFromParticipant(p);
-        return {
-          userId: participantUserIdString(p),
-          name: p.name,
-          avatar: p.avatar,
-          score: displayScoreForParticipant(created!, p, bodyWeight, gender),
-          value: p.value,
-          initialValue: p.initialValue,
-          initialScore: p.initialScore,
-          joinedAt: p.joinedAt,
-        };
-      });
-
-      res.status(201).json({
-        id: created!._id.toString(),
-        title: created!.title,
-        description: created!.description || '',
-        type: created!.type,
-        exercise: created!.exercise,
-        usePointsSystem: created!.usePointsSystem !== false,
-        bodyWeightScoring: normalizeBodyWeightScoring(created!.bodyWeightScoring),
-        createdAt: (created! as { createdAt?: Date }).createdAt
-          ? new Date((created! as { createdAt?: Date }).createdAt!).toISOString()
-          : new Date().toISOString(),
-        participants: participantsFormatted,
-        endDate: created!.endDate,
-        status: created!.endDate > new Date() ? 'active' : 'finished',
-        createdBy: {
-          id: (created!.createdBy as any)._id.toString(),
-          name: (created!.createdBy as any).name || (created!.createdBy as any).email,
-        },
-      });
+      res.status(201).json(formatChallengeDoc(created));
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }
@@ -247,21 +195,12 @@ router.post(
 router.put(
   '/:id/join',
   authenticateToken,
-  [
-    body('value').isNumeric().withMessage('El valor (reps/kg/segundos) es requerido'),
-  ],
   async (req: Request, res: Response) => {
     try {
-      const errors = validationResult(req);
-      if (!errors.isEmpty()) {
-        return res.status(400).json({ errors: errors.array() });
-      }
-
       const userId = (req as any).user.userId;
       const user = await User.findById(userId);
-      const value = parseFloat(req.body.value);
 
-      const challenge = await Challenge.findById(req.params.id);
+      const challenge = await Challenge.findById(req.params.id).select('+passwordHash');
       if (!challenge) {
         return res.status(404).json({ error: 'Challenge no encontrado' });
       }
@@ -273,8 +212,10 @@ router.put(
 
       const creatorId = challenge.createdBy.toString();
       const isCreator = creatorId === userId;
+      const existingParticipant = challenge.participants.find(
+        p => participantUserIdString(p) === userId
+      );
 
-      // Si no es el creador, verificar que es amigo del creador
       if (!isCreator) {
         const friendIds = await getFriendIds(creatorId);
         if (!friendIds.some(id => id.toString() === userId)) {
@@ -282,28 +223,59 @@ router.put(
         }
       }
 
+      if (challenge.isPrivate && !existingParticipant) {
+        const given = typeof req.body.password === 'string' ? req.body.password : '';
+        if (!challenge.passwordHash || !(await bcrypt.compare(given, challenge.passwordHash))) {
+          return res.status(403).json({ error: 'Contraseña incorrecta' });
+        }
+      }
+
+      const names = normalizeChallengeExercises(challenge.exercise, challenge.exercises);
+      const rawLifts = Array.isArray(req.body.lifts) ? req.body.lifts : null;
+      const lifts = (rawLifts && rawLifts.length > 0
+        ? rawLifts
+        : names.map((exercise, i) => ({
+            exercise,
+            value: i === 0 ? parseFloat(req.body.value) : NaN,
+          }))
+      )
+        .map((l: any) => ({
+          exercise: String(l?.exercise || '').trim(),
+          value: parseFloat(l?.value),
+        }))
+        .filter((l: { exercise: string; value: number }) => l.exercise && Number.isFinite(l.value) && l.value >= 0);
+
+      if (names.length > 1) {
+        const missing = names.filter((n) => !lifts.some((l: { exercise: string }) => l.exercise.toLowerCase() === n.toLowerCase()));
+        if (missing.length > 0) {
+          return res.status(400).json({ error: `Faltan marcas: ${missing.join(', ')}` });
+        }
+      } else if (lifts.length === 0) {
+        return res.status(400).json({ error: 'El valor (reps/kg/segundos) es requerido' });
+      }
+
+      const ordered = names.map((exercise) => {
+        const found = lifts.find((l: { exercise: string }) => l.exercise.toLowerCase() === exercise.toLowerCase());
+        return { exercise, value: found?.value ?? 0 };
+      });
+
       const bodyWeight = user?.bodyWeight ?? 70;
       const gender = user?.gender;
       const usePts = challenge.usePointsSystem !== false;
       const bwMode = normalizeBodyWeightScoring(challenge.bodyWeightScoring);
-      const score = computeChallengeScore(
+      const { value, score } = computeMultiLiftScore(
         challenge.type as ChallengeScoreType,
-        value,
+        ordered,
         bodyWeight,
         gender,
-        challenge.exercise,
         usePts,
         bwMode
-      );
-
-      const existingParticipant = challenge.participants.find(
-        p => participantUserIdString(p) === userId
       );
 
       if (existingParticipant) {
         existingParticipant.score = score;
         existingParticipant.value = value;
-        // Mantener initialValue/initialScore/joinedAt para cálculo de progreso
+        existingParticipant.lifts = ordered;
       } else {
         challenge.participants.push({
           userId: userId as any,
@@ -311,16 +283,28 @@ router.put(
           avatar: user?.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(user?.name || user?.email || 'Usuario')}`,
           score,
           value,
+          lifts: ordered,
           initialValue: value,
           initialScore: score,
           joinedAt: new Date(),
         });
       }
 
+      const justJoined = !existingParticipant;
+      const firstRealMark = Boolean(
+        existingParticipant &&
+        existingParticipant.initialRank == null &&
+        value > 0
+      );
+      if (justJoined || firstRealMark) {
+        const rank = rankOfParticipant(challenge.participants, userId, challenge.usePointsSystem);
+        const target = challenge.participants.find((p) => participantUserIdString(p) === userId);
+        if (target && rank > 0) target.initialRank = rank;
+      }
+
       await challenge.save();
 
-      // Notificar al creador cuando un amigo se une (no si el creador actualiza su propia marca)
-      if (!isCreator) {
+      if (!isCreator && !existingParticipant) {
         const joinerName = user?.name || user?.email || 'Alguien';
         try {
           const notif = new Notification({
@@ -341,6 +325,8 @@ router.put(
               type: 'challenge_join',
               challengeId: challenge._id.toString(),
               relatedUserId: String(userId),
+              screen: 'social',
+              tab: 'challenges',
             }
           );
         } catch (e) {
@@ -356,43 +342,30 @@ router.put(
         .populate('createdBy', 'name email avatar')
         .populate('participants.userId', 'name email avatar bodyWeight gender');
 
-      res.json({
-        id: updated!._id.toString(),
-        title: updated!.title,
-        description: updated!.description || '',
-        type: updated!.type,
-        exercise: updated!.exercise,
-        usePointsSystem: updated!.usePointsSystem !== false,
-        bodyWeightScoring: normalizeBodyWeightScoring(updated!.bodyWeightScoring),
-        createdAt: (updated! as { createdAt?: Date }).createdAt
-          ? new Date((updated! as { createdAt?: Date }).createdAt!).toISOString()
-          : undefined,
-        participants: updated!.participants.map(p => {
-          const { bodyWeight, gender } = getBodyWeightAndGenderFromParticipant(p);
-          const populatedUser = p.userId as any;
-          const avatar = p.avatar || populatedUser?.avatar || `https://ui-avatars.com/api/?name=${encodeURIComponent(p.name || populatedUser?.name || 'U')}`;
-          return {
-            userId: participantUserIdString(p),
-            name: p.name,
-            avatar,
-            score: displayScoreForParticipant(updated!, p, bodyWeight, gender),
-            value: p.value,
-            initialValue: p.initialValue,
-            initialScore: p.initialScore,
-            joinedAt: p.joinedAt,
-          };
-        }),
-        endDate: updated!.endDate,
-        status: updated!.endDate > new Date() ? 'active' : 'finished',
-        createdBy: {
-          id: (updated!.createdBy as any)._id.toString(),
-          name: (updated!.createdBy as any).name || (updated!.createdBy as any).email,
-        },
-      });
+      res.json(formatChallengeDoc(updated));
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }
   }
 );
+
+router.delete('/:id', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const userId = String((req as any).user.userId);
+    const challenge = await Challenge.findById(req.params.id);
+    if (!challenge) return res.status(404).json({ error: 'Torneo no encontrado' });
+    const creatorId = String((challenge.createdBy as any)?._id || challenge.createdBy);
+    if (creatorId !== userId) {
+      return res.status(403).json({ error: 'Solo quien lo creó puede borrarlo' });
+    }
+    const participantIds = (challenge.participants || []).map((p) => participantUserIdString(p));
+    if (!participantIds.includes(creatorId)) participantIds.push(creatorId);
+    await Challenge.deleteOne({ _id: challenge._id });
+    broadcastSse(participantIds, 'challenge_update');
+    res.json({ ok: true });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
 export default router;

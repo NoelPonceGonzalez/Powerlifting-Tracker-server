@@ -1,4 +1,5 @@
 import express, { Request, Response } from 'express';
+import multer from 'multer';
 import { body, validationResult } from 'express-validator';
 import { User } from '../models/User';
 import { PendingSignup, IPendingSignup } from '../models/PendingSignup';
@@ -7,6 +8,21 @@ import { hashPassword, comparePassword } from '../utils/crypto';
 import { generateToken, authenticateToken, AuthRequest } from '../middleware/auth';
 import { logger } from '../utils/logger';
 import { config, getPublicWebBaseUrl } from '../config/env';
+import {
+  isInlineAvatar,
+  publicAvatarRef,
+  resolveIncomingAvatar,
+  saveAvatarBuffer,
+  saveAvatarDataUrl,
+} from '../utils/avatarMedia';
+const avatarUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 6 * 1024 * 1024 },
+});
+
+/** Login sin avatar ni tokens de push: un data: enorme en Mongo hacía que el fetch saltara por timeout. */
+const LOGIN_SELECT =
+  'email username password name gender bodyWeight theme progressMode mbMode emailVerified';
 
 const router = express.Router();
 
@@ -577,8 +593,10 @@ router.post(
 
       const { token, name, bodyWeight, password, gender } = req.body;
       const rawAvatar = typeof req.body.avatar === 'string' ? req.body.avatar.trim() : '';
-      const avatar =
-        rawAvatar.startsWith('data:image/') && rawAvatar.length <= 700_000 ? rawAvatar : '';
+      let avatar = '';
+      if (rawAvatar) {
+        avatar = (await resolveIncomingAvatar(rawAvatar, '')) || '';
+      }
 
       const pending = await PendingSignup.findOne({
         verificationToken: token,
@@ -703,18 +721,18 @@ router.post(
       let user;
       try {
         if (isEmailLogin) {
-          user = await User.findOne({ email: normalizedIdentifier });
+          user = await User.findOne({ email: normalizedIdentifier }).select(LOGIN_SELECT);
         } else {
           // 1) Intentar por username exacto (case-insensitive)
           user = await User.findOne({
             username: { $regex: `^${escapeRegex(rawIdentifier)}$`, $options: 'i' },
-          });
+          }).select(LOGIN_SELECT);
 
           // 2) Si no existe, intentar por nombre exacto (case-insensitive)
           if (!user) {
             user = await User.findOne({
               name: { $regex: `^${escapeRegex(rawIdentifier)}$`, $options: 'i' },
-            });
+            }).select(LOGIN_SELECT);
           }
 
           // 3) Si sigue sin existir, normalizar como username generado desde nombre
@@ -728,7 +746,7 @@ router.post(
             if (normalizedAsUsername.length >= 3) {
               user = await User.findOne({
                 username: { $regex: `^${escapeRegex(normalizedAsUsername)}$`, $options: 'i' },
-              });
+              }).select(LOGIN_SELECT);
 
               // 4) Fallback: si al registrar se añadió sufijo numérico (ej: Noel -> Noel1),
               // aceptar el base solo cuando hay una coincidencia única.
@@ -738,7 +756,9 @@ router.post(
                     $regex: `^${escapeRegex(normalizedAsUsername)}\\d*$`,
                     $options: 'i',
                   },
-                }).limit(2);
+                })
+                  .select(LOGIN_SELECT)
+                  .limit(2);
 
                 if (candidates.length === 1) {
                   user = candidates[0];
@@ -808,6 +828,35 @@ router.post(
       }
 
       logger.info('POST /login - Login exitoso', { userId: user._id.toString(), username: user.username });
+
+      const [avatarMeta] = await User.aggregate<{ prefix: string; avatar: string }>([
+        { $match: { _id: user._id } },
+        {
+          $project: {
+            prefix: { $substrBytes: [{ $ifNull: ['$avatar', ''] }, 0, 11] },
+            avatar: {
+              $cond: [
+                {
+                  $lt: [{ $strLenBytes: { $ifNull: ['$avatar', ''] } }, 400],
+                },
+                { $ifNull: ['$avatar', ''] },
+                '',
+              ],
+            },
+          },
+        },
+      ]);
+      let avatar = publicAvatarRef(avatarMeta?.avatar);
+      if (avatarMeta?.prefix?.startsWith('data:')) {
+        void User.findById(user._id)
+          .select('avatar')
+          .then(async (row) => {
+            if (!row || !isInlineAvatar(row.avatar)) return;
+            const key = await saveAvatarDataUrl(String(row.avatar));
+            await User.updateOne({ _id: row._id }, { $set: { avatar: key } });
+          })
+          .catch((err) => logger.warn('[avatar] Migración en login omitida', err));
+      }
       
       res.json({
         message: 'Login exitoso',
@@ -819,7 +868,7 @@ router.post(
           name: user.name,
           gender: user.gender,
           bodyWeight: user.bodyWeight,
-          avatar: user.avatar || '',
+          avatar,
           theme: user.theme ?? undefined,
           progressMode: user.progressMode ?? undefined,
           mbMode: !!user.mbMode,
@@ -859,9 +908,38 @@ router.post(
 // 5. Obtener usuario actual
 router.get('/me', authenticateToken, async (req: AuthRequest, res: Response) => {
   try {
-    const user = await User.findById(req.userId).select('-password -resetPasswordToken');
+    const user = await User.findById(req.userId).select(
+      '-password -resetPasswordToken -pushTokens -webPushSubscriptions -avatar'
+    );
     if (!user) {
       return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
+
+    const [avatarMeta] = await User.aggregate<{ prefix: string; avatar: string }>([
+      { $match: { _id: user._id } },
+      {
+        $project: {
+          prefix: { $substrBytes: [{ $ifNull: ['$avatar', ''] }, 0, 11] },
+          avatar: {
+            $cond: [
+              { $lt: [{ $strLenBytes: { $ifNull: ['$avatar', ''] } }, 400] },
+              { $ifNull: ['$avatar', ''] },
+              '',
+            ],
+          },
+        },
+      },
+    ]);
+    let avatar = publicAvatarRef(avatarMeta?.avatar);
+    if (avatarMeta?.prefix?.startsWith('data:')) {
+      void User.findById(user._id)
+        .select('avatar')
+        .then(async (row) => {
+          if (!row || !isInlineAvatar(row.avatar)) return;
+          const key = await saveAvatarDataUrl(String(row.avatar));
+          await User.updateOne({ _id: row._id }, { $set: { avatar: key } });
+        })
+        .catch((err) => logger.warn('[avatar] Migración en /me omitida', err));
     }
 
     res.json({ 
@@ -873,7 +951,7 @@ router.get('/me', authenticateToken, async (req: AuthRequest, res: Response) => 
         name: user.name,
         gender: user.gender,
         bodyWeight: user.bodyWeight,
-        avatar: user.avatar,
+        avatar,
         theme: user.theme,
         progressMode: user.progressMode ?? undefined,
         mbMode: !!user.mbMode,
@@ -914,11 +992,11 @@ router.post('/logout', authenticateToken, async (req: Request, res: Response) =>
 // 7. Actualizar usuario (apariencia/theme, nombre, bodyWeight, etc.)
 router.put('/me', authenticateToken, async (req: AuthRequest, res: Response) => {
   try {
-    const user = await User.findById(req.userId);
+    const user = await User.findById(req.userId).select('-pushTokens -webPushSubscriptions -avatar');
     if (!user) {
       return res.status(404).json({ error: 'Usuario no encontrado' });
     }
-    const { theme, name, bodyWeight, avatar, progressMode, mbMode } = req.body;
+    const { theme, name, bodyWeight, avatar, progressMode, mbMode, gender } = req.body;
     if (theme !== undefined) {
       if (theme === 'light' || theme === 'dark') {
         user.theme = theme;
@@ -926,7 +1004,24 @@ router.put('/me', authenticateToken, async (req: AuthRequest, res: Response) => 
     }
     if (name !== undefined && typeof name === 'string') user.name = name.trim();
     if (bodyWeight !== undefined && typeof bodyWeight === 'number') user.bodyWeight = bodyWeight;
-    if (avatar !== undefined && typeof avatar === 'string') user.avatar = avatar;
+    if (gender === 'hombre' || gender === 'mujer') user.gender = gender;
+    if (avatar !== undefined && typeof avatar === 'string') {
+      const [prevMeta] = await User.aggregate<{ avatar: string }>([
+        { $match: { _id: user._id } },
+        {
+          $project: {
+            avatar: {
+              $cond: [
+                { $lt: [{ $strLenBytes: { $ifNull: ['$avatar', ''] } }, 400] },
+                { $ifNull: ['$avatar', ''] },
+                '',
+              ],
+            },
+          },
+        },
+      ]);
+      user.avatar = await resolveIncomingAvatar(avatar, prevMeta?.avatar);
+    }
     if (progressMode !== undefined) {
       if (progressMode === 'month' || progressMode === 'year') {
         user.progressMode = progressMode;
@@ -936,6 +1031,24 @@ router.put('/me', authenticateToken, async (req: AuthRequest, res: Response) => 
       user.mbMode = !!mbMode;
     }
     await user.save();
+    let avatarOut = publicAvatarRef(user.avatar);
+    if (avatar === undefined) {
+      const [m] = await User.aggregate<{ avatar: string }>([
+        { $match: { _id: user._id } },
+        {
+          $project: {
+            avatar: {
+              $cond: [
+                { $lt: [{ $strLenBytes: { $ifNull: ['$avatar', ''] } }, 400] },
+                { $ifNull: ['$avatar', ''] },
+                '',
+              ],
+            },
+          },
+        },
+      ]);
+      avatarOut = publicAvatarRef(m?.avatar);
+    }
     res.json({
       user: {
         id: user._id.toString(),
@@ -944,7 +1057,7 @@ router.put('/me', authenticateToken, async (req: AuthRequest, res: Response) => 
         name: user.name,
         gender: user.gender,
         bodyWeight: user.bodyWeight,
-        avatar: user.avatar || '',
+        avatar: avatarOut,
         theme: user.theme ?? undefined,
         progressMode: user.progressMode ?? undefined,
         mbMode: !!user.mbMode,
@@ -956,5 +1069,38 @@ router.put('/me', authenticateToken, async (req: AuthRequest, res: Response) => 
     res.status(500).json({ error: 'Error al actualizar el usuario' });
   }
 });
+
+router.post(
+  '/me/avatar',
+  authenticateToken,
+  avatarUpload.single('file'),
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const file = (req as any).file as { buffer: Buffer; mimetype: string } | undefined;
+      if (!file) return res.status(400).json({ error: 'Falta la foto' });
+      const key = await saveAvatarBuffer(file.buffer, file.mimetype);
+      const [prevMeta] = await User.aggregate<{ avatar: string }>([
+        { $match: { _id: req.userId } },
+        {
+          $project: {
+            avatar: {
+              $cond: [
+                { $lt: [{ $strLenBytes: { $ifNull: ['$avatar', ''] } }, 400] },
+                { $ifNull: ['$avatar', ''] },
+                '',
+              ],
+            },
+          },
+        },
+      ]);
+      await resolveIncomingAvatar(key, prevMeta?.avatar);
+      await User.updateOne({ _id: req.userId }, { $set: { avatar: key } });
+      res.json({ avatar: key });
+    } catch (error: any) {
+      logger.error('Error subiendo avatar', error);
+      res.status(400).json({ error: error.message || 'No se ha podido guardar la foto' });
+    }
+  }
+);
 
 export default router;

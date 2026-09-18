@@ -225,7 +225,7 @@ router.put(
         await HistoryTmSnapshot.updateMany(filter, { $set: { value: newValue } });
       }
       // Solo se avisa de los ejercicios que el usuario comparte: el resto son privados.
-      if (!correction && Number.isFinite(newValue) && newValue > prevValue && updated.sharedToSocial) {
+      if (!correction && Number.isFinite(newValue) && newValue > prevValue) {
         (async () => {
           try {
             const friendships = await Friendship.find({

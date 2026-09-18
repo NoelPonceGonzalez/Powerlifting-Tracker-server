@@ -49,7 +49,7 @@ function urlFromPayload(data?: Record<string, string>): string {
   const screen = data?.screen || 'dashboard';
   if (screen === 'program') return '/?pwa=plan';
   if (screen === 'social') {
-    const tab = data?.tab || 'feed';
+    const tab = data?.tab || 'chat';
     return `/?pwa=social&tab=${encodeURIComponent(tab)}`;
   }
   return '/?pwa=dashboard';

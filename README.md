@@ -50,20 +50,11 @@ server/
 
 ### Flujo de Registro
 
-1. **POST `/api/auth/register`** - Registro inicial (solo email)
-   - Recibe: `{ email: "usuario@example.com" }`
-   - Envía email de verificación
-   - Retorna: `{ message: "Email enviado", requiresVerification: true }`
+1. **POST `/api/auth/register`** — solo el email. Envía un código de 6 dígitos (o lo imprime en consola si no hay `EMAIL_USER` / `EMAIL_PASS`).
+2. **POST `/api/auth/verify-registration-code`** — el usuario escribe el código.
+3. **POST `/api/auth/complete-registration`** — nombre, género, peso y contraseña. Crea la cuenta y devuelve el JWT.
 
-2. **GET `/api/auth/verify-email?token=XXX`** - Verificar email
-   - Usuario hace clic en el enlace del email
-   - Muestra formulario para completar registro (género, nombre, contraseña)
-   - El formulario envía POST a `/api/auth/complete-registration`
-
-3. **POST `/api/auth/complete-registration`** - Completar registro
-   - Recibe: `{ token, name, password, gender }`
-   - Valida y crea la cuenta completa
-   - Retorna: `{ token: JWT, user: {...} }`
+No hay enlace `GET /api/auth/verify-email`.
 
 ### Login
 

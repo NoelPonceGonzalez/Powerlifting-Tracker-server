@@ -42,7 +42,7 @@ function buildPushDataPayload(data?: Record<string, any>): Record<string, string
   const type = String(data?.type ?? '');
 
   let screen: 'dashboard' | 'program' | 'social' = 'dashboard';
-  let tab: 'friends' | 'challenges' | 'checkins' = 'checkins';
+  let tab: 'friends' | 'challenges' | 'checkins' | 'chat' = 'checkins';
 
   if (type === 'new_rm') {
     screen = 'dashboard';
@@ -55,8 +55,10 @@ function buildPushDataPayload(data?: Record<string, any>): Record<string, string
   } else if (type === 'gym_checkin' || type === 'same_time_confirmation') {
     screen = 'social';
     tab = 'checkins';
+  } else if (type === 'chat_message') {
+    screen = 'social';
+    tab = 'chat';
   } else if (
-    type === 'chat_message' ||
     type === 'chat_request' ||
     type === 'group_invite' ||
     type === 'post_like' ||

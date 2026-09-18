@@ -6,9 +6,12 @@ export interface IChallengeParticipant {
   name: string;
   avatar: string;
   score: number;
-  value: number; // raw value (e.g. reps)
+  value: number; // raw value (e.g. reps) o suma si hay varios ejercicios
+  lifts?: { exercise: string; value: number }[];
   initialValue?: number; // primera marca al unirse (para calcular progreso)
   initialScore?: number;
+  /** Puesto (1 = primero) en el momento de meterse. Sirve para ver si has subido o bajado. */
+  initialRank?: number;
   joinedAt?: Date; // fecha de primera participación
 }
 
@@ -20,6 +23,10 @@ export interface IChallenge extends Document {
   description?: string;
   type: ChallengeType;
   exercise: string;
+  /** Uno o varios (SBD, etc.). `exercise` se guarda como texto unido por compatibilidad. */
+  exercises?: string[];
+  isPrivate?: boolean;
+  passwordHash?: string;
   /** Si false, el ranking usa la marca bruta (kg / reps / s). Si true, IPF GL (peso) y fórmulas por peso/género (reps/seg). */
   usePointsSystem: boolean;
   /** Ponderación por peso en reps/seg: más peso = más puntos | menos peso = más puntos | sin ponderar. */
@@ -53,8 +60,19 @@ const ChallengeParticipantSchema = new Schema<IChallengeParticipant>({
     type: Number,
     required: true,
   },
+  lifts: {
+    type: [
+      {
+        exercise: { type: String, required: true },
+        value: { type: Number, required: true },
+        _id: false,
+      },
+    ],
+    default: undefined,
+  },
   initialValue: { type: Number },
   initialScore: { type: Number },
+  initialRank: { type: Number },
   joinedAt: { type: Date },
 }, { _id: false });
 
@@ -83,6 +101,19 @@ const ChallengeSchema = new Schema<IChallenge>(
     exercise: {
       type: String,
       required: true,
+    },
+    exercises: {
+      type: [String],
+      default: undefined,
+    },
+    isPrivate: {
+      type: Boolean,
+      default: false,
+    },
+    passwordHash: {
+      type: String,
+      default: '',
+      select: false,
     },
     usePointsSystem: {
       type: Boolean,

@@ -330,6 +330,19 @@ router.post(
           relatedUserId: toObjectId(userId),
           relatedData: { postId: String(post._id) },
         }).catch(() => {});
+        if (story) {
+          try {
+            const { sendPushToUser } = await import('../utils/push');
+            await sendPushToUser(ownerId, 'Historia', snippet, {
+              type: 'post_comment',
+              screen: 'social',
+              tab: 'chat',
+              peerId: String(userId),
+            });
+          } catch (e) {
+            console.error('[PUSH] Error comentario de historia:', e);
+          }
+        }
       }
 
       if (story && ownerId !== String(userId)) {

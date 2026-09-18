@@ -19,6 +19,7 @@ import mediaRoutes from './routes/media';
 import sseRoutes from './routes/sse';
 import { formatApiRequestLogLine } from './utils/apiRequestLogLabel';
 import { processFinishedChallengeWinnerNotifications } from './utils/challengeFinishedNotifications';
+import { migrateInlineAvatars } from './utils/avatarMedia';
 
 /** Build de Vite en ../client/dist — misma carpeta raíz que `server/`. La WebView de Expo hace GET / aquí. */
 const __filename = fileURLToPath(import.meta.url);
@@ -169,6 +170,7 @@ const startServer = async () => {
       const { ensureStoryTtlGrace, startStoryCleanup } = await import('./utils/storyCleanup');
       await ensureStoryTtlGrace().catch(e => logger.warn('TTL de historias', e));
       startStoryCleanup();
+      await migrateInlineAvatars().catch((e) => logger.warn('Migración de avatares', e));
     };
 
     if (isDbConnected()) {
@@ -211,6 +213,15 @@ const startServer = async () => {
           ? `\n📧 Email configurado: ${config.email.user}`
           : `\n📧 Email sin configurar (EMAIL_USER / EMAIL_PASS): los códigos de verificación salen por consola`
       );
+      if (config.nodeEnv === 'production') {
+        const mediaDriver = (process.env.MEDIA_DRIVER || 'local').trim().toLowerCase();
+        if (mediaDriver !== 's3') {
+          logger.warn('Producción con MEDIA_DRIVER=local: las fotos y vídeos se guardan en el disco de este servidor. Usa S3 o R2.');
+        }
+        if (!process.env.VAPID_PUBLIC_KEY || !process.env.VAPID_PRIVATE_KEY) {
+          logger.warn('Producción sin VAPID: los avisos no llegarán con la app cerrada. Genera claves con npx web-push generate-vapid-keys.');
+        }
+      }
       console.log(`\n⏳ Esperando conexiones...\n`);
       logger.info(startupMessage);
       logger.info(`📁 Logs guardados en: ${process.cwd()}/logs/`);
