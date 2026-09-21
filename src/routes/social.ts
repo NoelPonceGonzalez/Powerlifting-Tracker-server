@@ -155,7 +155,43 @@ router.get(
   }
 );
 
-/** Usuarios sugeridos para enviar solicitud: excluye tú, amigos y cualquier solicitud (pendiente o ya resuelta con esa persona). */
+function suggestionCard(
+  user: { _id: unknown; name?: string; username?: string; email?: string; avatar?: string; bodyWeight?: number },
+  extra: { friendshipStatus?: 'follower' | null; friendshipDirection?: 'incoming' | null; reason: 'followback' | 'friends' | 'discover' }
+) {
+  const oid = String(user._id);
+  return {
+    id: oid,
+    name: user.name || user.username || user.email,
+    email: user.email,
+    username: user.username,
+    avatar: publicListAvatar(user.avatar, oid),
+    bodyWeight: user.bodyWeight,
+    friendshipStatus: extra.friendshipStatus ?? null,
+    friendshipDirection: extra.friendshipDirection ?? null,
+    canSendRequest: true,
+    reason: extra.reason,
+  };
+}
+
+function shuffleIds(ids: string[]) {
+  const a = [...ids];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+function asObjectIds(ids: Iterable<string>) {
+  const out: mongoose.Types.ObjectId[] = [];
+  for (const id of ids) {
+    if (mongoose.isValidObjectId(id)) out.push(new mongoose.Types.ObjectId(id));
+  }
+  return out;
+}
+
+/** Sugerencias para seguir: te siguen, amigos de amigos, y gente nueva. Cambian en cada carga. */
 router.get('/suggestions', authenticateToken, async (req: Request, res: Response) => {
   try {
     const rawUserId = String((req as any).user.userId ?? '');
@@ -163,49 +199,73 @@ router.get('/suggestions', authenticateToken, async (req: Request, res: Response
     try {
       userIdOid = new mongoose.Types.ObjectId(rawUserId);
     } catch {
-      return res.json([]);
+      return res.json({ followBack: [], friends: [], discover: [] });
     }
 
-    const friendships = await Friendship.find({
-      $or: [{ requester: userIdOid }, { recipient: userIdOid }],
+    const { following, followers, pendingOutgoing } = await connectionSets(userIdOid.toString());
+    const incomingPending = await Friendship.find({
+      recipient: userIdOid,
+      status: 'pending',
     })
-      .select('requester recipient')
+      .select('requester')
       .lean();
 
-    const exclude = new Set<string>([userIdOid.toString()]);
-    const selfStr = userIdOid.toString();
-    for (const f of friendships) {
-      const reqId = String(f.requester);
-      const recId = String(f.recipient);
-      const other = reqId === selfStr ? recId : recId === selfStr ? reqId : null;
-      if (other) exclude.add(other);
+    const exclude = new Set<string>([userIdOid.toString(), ...following, ...pendingOutgoing]);
+    for (const row of incomingPending) exclude.add(String(row.requester));
+
+    const followBackIds = shuffleIds([...followers].filter(id => !exclude.has(id))).slice(0, 6);
+
+    const circleIds = asObjectIds(following);
+    const theirFollows =
+      circleIds.length === 0
+        ? []
+        : await Friendship.find({
+            requester: { $in: circleIds },
+            status: 'accepted',
+          })
+            .select('recipient')
+            .lean();
+
+    const fofSet = new Set<string>();
+    for (const row of theirFollows) {
+      const other = String(row.recipient);
+      if (!exclude.has(other) && !followBackIds.includes(other)) fofSet.add(other);
     }
+    const friendIds = shuffleIds([...fofSet]).slice(0, 8);
 
-    const excludeIds = [...exclude].map(id => new mongoose.Types.ObjectId(id));
-    const available = await User.countDocuments({
-      _id: { $nin: excludeIds },
-      ...REGISTERED_USER_MATCH,
-    });
-    if (available === 0) return res.json([]);
-
-    const sampleSize = Math.min(15, available);
-    const users = await User.aggregate([
-      { $match: { _id: { $nin: excludeIds }, ...REGISTERED_USER_MATCH } },
-      { $sample: { size: sampleSize } },
+    const taken = new Set<string>([...exclude, ...followBackIds, ...friendIds]);
+    const discoverUsers = await User.aggregate([
+      { $match: { _id: { $nin: asObjectIds(taken) }, ...REGISTERED_USER_MATCH } },
+      { $sample: { size: 8 } },
       { $project: { name: 1, email: 1, username: 1, avatar: 1, bodyWeight: 1 } },
     ]);
 
-    const results = users.map((user: any) => ({
-      id: user._id.toString(),
-      name: user.name || user.username || user.email,
-      email: user.email,
-      username: user.username,
-      avatar: publicListAvatar(user.avatar, user._id?.toString?.() || String(user._id || '')),
-      bodyWeight: user.bodyWeight,
-      friendshipStatus: null,
-    }));
+    const needed = [...new Set([...followBackIds, ...friendIds])];
+    const knownUsers =
+      needed.length === 0
+        ? []
+        : await User.find({ _id: { $in: asObjectIds(needed) }, ...REGISTERED_USER_MATCH })
+            .select('name email username avatar bodyWeight')
+            .lean();
+    const byId = new Map(knownUsers.map(u => [String(u._id), u]));
 
-    res.json(results);
+    const followBack = followBackIds
+      .map(id => byId.get(id))
+      .filter(Boolean)
+      .map(user =>
+        suggestionCard(user as any, {
+          reason: 'followback',
+          friendshipStatus: 'follower',
+          friendshipDirection: 'incoming',
+        })
+      );
+    const friends = friendIds
+      .map(id => byId.get(id))
+      .filter(Boolean)
+      .map(user => suggestionCard(user as any, { reason: 'friends' }));
+    const discover = discoverUsers.map((user: any) => suggestionCard(user, { reason: 'discover' }));
+
+    res.json({ followBack, friends, discover });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
