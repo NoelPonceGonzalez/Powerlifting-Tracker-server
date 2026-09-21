@@ -12,6 +12,10 @@ export interface IRoutine extends Document {
   sameTemplateAllWeeks?: boolean;
   hiddenFromSocial?: boolean;
   cycleLength?: number;
+  /** YYYY-MM-DD del primer día de la semana 1 del ciclo. */
+  cycleAnchorISO?: string;
+  /** 0 = domingo … 6 = sábado. Por defecto lunes. */
+  weekStartsOn?: number;
   /** Lineal: semanas civiles 1–53. Por bloque (sameTemplateAllWeeks false): posición en el mesociclo 1…cycleLength. */
   skippedWeeks?: number[];
   /** Semanas civiles donde «Saltar la semana» desplazó el ciclo (solo block mode). */
@@ -57,6 +61,16 @@ const RoutineSchema = new Schema<IRoutine>(
       default: 4,
       min: 1,
       max: 52,
+    },
+    cycleAnchorISO: {
+      type: String,
+      default: undefined,
+    },
+    weekStartsOn: {
+      type: Number,
+      default: 1,
+      min: 0,
+      max: 6,
     },
     skippedWeeks: {
       type: [Number],

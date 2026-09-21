@@ -15,7 +15,8 @@ export type NotificationType =
   | 'group_invite'
   | 'chat_request'
   | 'chat_message'
-  | 'post_comment_reply';
+  | 'post_comment_reply'
+  | 'workout_reminder';
 
 export interface INotification extends Document {
   userId: mongoose.Types.ObjectId; // Usuario que recibe la notificación
@@ -54,6 +55,7 @@ const NotificationSchema = new Schema<INotification>(
         'chat_request',
         'chat_message',
         'post_comment_reply',
+        'workout_reminder',
       ],
       required: true,
     },

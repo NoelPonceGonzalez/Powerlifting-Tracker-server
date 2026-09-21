@@ -7,6 +7,7 @@ export interface IGymCheckIn extends Document {
   gymName: string;
   time: string; // Formato: '18:00'
   timestamp: Date;
+  audience?: 'all' | 'close';
   /** Borrado automático por TTL: hora de entreno + 3 h (mismo día que timestamp). */
   expiresAt: Date;
   createdAt: Date;
@@ -37,6 +38,7 @@ const GymCheckInSchema = new Schema<IGymCheckIn>(
       default: Date.now,
       index: true,
     },
+    audience: { type: String, enum: ['all', 'close'], default: 'all' },
     // El índice se declara abajo con expireAfterSeconds; ponerlo también aquí lo duplica.
     expiresAt: {
       type: Date,

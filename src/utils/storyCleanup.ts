@@ -4,7 +4,7 @@ import { ChatMessage } from '../models/ChatMessage';
 import { Notification } from '../models/Notification';
 import { CHAT_MEDIA_LIFETIME_MS } from './chatMedia';
 import { mediaStorage } from './mediaStorage';
-import { logger } from './logger';
+import { logger, sweepAppLogs } from './logger';
 
 const ACTIVITY_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const TEST_NOTE = /prueba|aviso de prueba|notificaciones ya llegan/i;
@@ -117,6 +117,12 @@ export function startStoryCleanup(): NodeJS.Timeout {
     void sweepExpiredStories().catch(e => logger.warn('[historias] barrida fallida', e));
     void sweepExpiredChatMedia().catch(e => logger.warn('[chat] barrida de medios fallida', e));
     void sweepOldNotifications().catch(e => logger.warn('[actividad] barrida fallida', e));
+    try {
+      const trimmed = sweepAppLogs();
+      if (trimmed > 0) logger.info(`[logs] ${trimmed} archivo(s) recortados`);
+    } catch (e) {
+      logger.warn('[logs] barrida fallida', e);
+    }
   };
   run();
   const timer = setInterval(run, SWEEP_INTERVAL_MS);

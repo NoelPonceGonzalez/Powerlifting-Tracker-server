@@ -2,6 +2,7 @@ import express, { NextFunction, Request, Response } from 'express';
 import mongoose from 'mongoose';
 import multer from 'multer';
 import { authenticateToken } from '../middleware/auth';
+import { searchBurstLimit } from '../middleware/rateLimit';
 import { User } from '../models/User';
 import { Friendship } from '../models/Friendship';
 import { Notification } from '../models/Notification';
@@ -21,7 +22,8 @@ import { assembleFullRoutine } from '../utils/assembleRoutine';
 import { broadcastSse, isUserOnline } from '../utils/sse';
 import { isSupportedMediaType, mediaKindFromMime, mediaStorage } from '../utils/mediaStorage';
 import { chatMediaExpiresAt, isChatMediaLive } from '../utils/chatMedia';
-import { areFriends, canSeeContent, connectionSets, describeRelation, follows, loadPair, mutualFriendIds } from '../utils/friendship';
+import { areFriends, connectionSets, describeRelation, follows, loadPair, mutualFriendIds } from '../utils/friendship';
+import { blockBetween, blockedIdsFor, loadPrivacy } from '../utils/privacy';
 import { chatIsOpen, ensurePendingChatRequest, wipeDmBothSides } from '../utils/chatAccess';
 import { publicListAvatar } from '../utils/avatarMedia';
 
@@ -62,6 +64,7 @@ const REGISTERED_USER_MATCH = {
 router.get(
   '/search',
   authenticateToken,
+  searchBurstLimit,
   async (req: Request, res: Response) => {
     try {
       const userId = String((req as any).user.userId ?? '').trim();
@@ -132,8 +135,16 @@ router.get(
         else theirsByOther.set(otherUserId, f);
       });
 
+      const { blocked: iBlocked } = await loadPrivacy(userId);
+      const theyBlocked = new Set(
+        (
+          await User.find({ _id: { $in: userIds }, blockedUserIds: userIdOid }).select('_id').lean()
+        ).map(u => String(u._id))
+      );
+
       const results = usersForResults.map(user => {
         const oid = user._id.toString();
+        const blocked: 'you' | 'them' | null = theyBlocked.has(oid) ? 'them' : iBlocked.has(oid) ? 'you' : null;
         const rel = describeRelation(mineByOther.get(oid), theirsByOther.get(oid));
         return {
           id: oid,
@@ -142,9 +153,10 @@ router.get(
           username: (user as any).username,
           avatar: publicListAvatar(user.avatar, oid),
           bodyWeight: user.bodyWeight,
-          friendshipStatus: rel.status === 'none' ? null : rel.status,
-          friendshipDirection: rel.direction,
-          canSendRequest: rel.canSend,
+          friendshipStatus: blocked ? null : rel.status === 'none' ? null : rel.status,
+          friendshipDirection: blocked ? null : rel.direction,
+          canSendRequest: blocked ? false : rel.canSend,
+          blocked,
         };
       });
 
@@ -228,6 +240,8 @@ router.get('/suggestions', authenticateToken, async (req: Request, res: Response
 
     const exclude = new Set<string>([userIdOid.toString(), ...following, ...pendingOutgoing]);
     for (const row of incomingPending) exclude.add(String(row.requester));
+    const hidden = await blockedIdsFor(userIdOid.toString());
+    for (const id of hidden) exclude.add(id);
 
     const followBackIds = shuffleIds([...followers].filter(id => !exclude.has(id))).slice(0, 6);
 
@@ -292,8 +306,12 @@ router.get('/friends/:friendId/routine', authenticateToken, async (req: Request,
     const userId = (req as any).user.userId;
     const friendId = req.params.friendId;
 
-    if (!(await canSeeContent(String(userId), String(friendId)))) {
-      return res.status(403).json({ error: 'Solo puedes ver la rutina de a quien sigues' });
+    const blockedRoutine = await blockBetween(String(userId), String(friendId));
+    if (blockedRoutine === 'them') {
+      return res.status(403).json({ error: 'Te ha bloqueado', blocked: 'them' });
+    }
+    if (blockedRoutine === 'you') {
+      return res.status(403).json({ error: 'Has bloqueado a esta persona', blocked: 'you' });
     }
 
     const friendObjectId = new mongoose.Types.ObjectId(String(friendId));
@@ -337,8 +355,12 @@ router.get('/friends/:friendId/profile', authenticateToken, async (req: Request,
     const userId = (req as any).user.userId;
     const friendId = req.params.friendId;
 
-    if (!(await canSeeContent(String(userId), String(friendId)))) {
-      return res.status(403).json({ error: 'Solo puedes ver el perfil de a quien sigues' });
+    const blocked = await blockBetween(String(userId), String(friendId));
+    if (blocked === 'them') {
+      return res.status(403).json({ error: 'Te ha bloqueado', blocked: 'them' });
+    }
+    if (blocked === 'you') {
+      return res.status(403).json({ error: 'Has bloqueado a esta persona', blocked: 'you' });
     }
 
     const friend = await User.findById(friendId).select('name avatar bio coachId').lean();
@@ -867,9 +889,19 @@ router.get('/users/:userId/profile', authenticateToken, async (req: Request, res
     if (!target) return res.status(404).json({ error: 'Usuario no encontrado' });
 
     const isSelf = String(targetId) === String(viewerId);
+    if (!isSelf) {
+      const blocked = await blockBetween(String(viewerId), String(targetId));
+      if (blocked === 'them') {
+        return res.status(403).json({ error: 'Te ha bloqueado', blocked: 'them' });
+      }
+      if (blocked === 'you') {
+        return res.status(403).json({ error: 'Has bloqueado a esta persona', blocked: 'you' });
+      }
+    }
     const pair = isSelf ? { mine: null, theirs: null } : await loadPair(String(viewerId), String(targetId));
     const rel = describeRelation(pair.mine, pair.theirs);
     const isFriend = isSelf || rel.status === 'accepted' || rel.status === 'following';
+    const { close } = isSelf ? { close: new Set<string>() } : await loadPrivacy(String(viewerId));
 
     const [postCount, sets, athleteCount, coach] = await Promise.all([
       Post.countDocuments({ userId: targetId, kind: 'post' }),
@@ -887,9 +919,7 @@ router.get('/users/:userId/profile', authenticateToken, async (req: Request, res
           CoachRequest.findOne({ athlete: targetId, coach: viewerId }).lean(),
         ]);
 
-    const activeRoutine = isFriend
-      ? await Routine.findOne({ userId: targetId, isActive: true }).select('_id name').lean()
-      : null;
+    const activeRoutine = await Routine.findOne({ userId: targetId, isActive: true }).select('_id name').lean();
     const trainingMaxes = activeRoutine?._id
       ? await TrainingMax.find({ userId: targetId, routineId: activeRoutine._id, sharedToSocial: true })
           .select('name value mode')
@@ -905,6 +935,7 @@ router.get('/users/:userId/profile', authenticateToken, async (req: Request, res
       bio: target.bio || '',
       isSelf,
       isFriend,
+      isCloseFriend: !isSelf && close.has(String(targetId)),
       friendshipStatus: isSelf ? 'self' : rel.status,
       friendshipDirection: isSelf ? null : rel.direction,
       canSendRequest: !isSelf && rel.canSend,
@@ -941,11 +972,14 @@ router.get('/users/:userId/training-maxes/:tmId/history', authenticateToken, asy
     }
 
     const isSelf = viewerId === targetId;
-    const friendship = isSelf ? false : await canSeeContent(viewerId, targetId);
-    const target = await User.findById(targetId).select('coachId').lean();
-    const iAmCoach = !!(target && String(target.coachId || '') === viewerId);
-    if (!isSelf && !friendship && !iAmCoach) {
-      return res.status(403).json({ error: 'Solo amigos o el entrenador pueden ver esta gráfica' });
+    if (!isSelf) {
+      const blocked = await blockBetween(viewerId, targetId);
+      if (blocked === 'them') {
+        return res.status(403).json({ error: 'Te ha bloqueado', blocked: 'them' });
+      }
+      if (blocked === 'you') {
+        return res.status(403).json({ error: 'Has bloqueado a esta persona', blocked: 'you' });
+      }
     }
 
     const tm = await TrainingMax.findOne({ _id: tmId, userId: targetId }).lean();
@@ -1598,6 +1632,7 @@ router.get('/chats', authenticateToken, async (req: Request, res: Response) => {
     const hideGroup = new Map(
       hides.filter(h => h.kind === 'group').map(h => [String(h.targetId), h.hiddenAt])
     );
+    const chatHidden = await blockedIdsFor(me);
 
     const rows = await ChatMessage.find({
       groupId: null,
@@ -1613,6 +1648,10 @@ router.get('/chats', authenticateToken, async (req: Request, res: Response) => {
       if (!row.to) continue;
       const peerId = String(row.from) === me ? String(row.to) : String(row.from);
       if (seen.has(peerId)) continue;
+      if (chatHidden.has(peerId)) {
+        seen.add(peerId);
+        continue;
+      }
       const hiddenAt = hideDm.get(peerId);
       if (hiddenAt && row.createdAt <= hiddenAt) {
         seen.add(peerId);
@@ -2179,6 +2218,12 @@ router.delete('/chats/:peerId', authenticateToken, async (req: Request, res: Res
     if (!mongoose.isValidObjectId(peerId) || peerId === me) {
       return res.status(400).json({ error: 'Chat inválido' });
     }
+    const forEveryone = req.body?.forEveryone === true || req.query.forEveryone === '1';
+    if (forEveryone) {
+      await wipeDmBothSides(me, peerId);
+      res.json({ ok: true, forEveryone: true });
+      return;
+    }
     await hideChatForMe(me, 'dm', peerId);
     await ChatMessage.updateMany(
       { groupId: null, from: peerId, to: me, readAt: null },
@@ -2214,6 +2259,13 @@ router.get('/chats/:peerId/messages', authenticateToken, async (req: Request, re
   try {
     const me = String((req as any).user.userId);
     const peerId = String(req.params.peerId);
+    const blockedChat = await blockBetween(me, peerId);
+    if (blockedChat === 'them') {
+      return res.status(403).json({ error: 'Te ha bloqueado', blocked: 'them' });
+    }
+    if (blockedChat === 'you') {
+      return res.status(403).json({ error: 'Has bloqueado a esta persona', blocked: 'you' });
+    }
     const outgoing = await ChatRequest.findOne({ from: me, to: peerId, status: 'pending' }).lean();
     const incoming = await ChatRequest.findOne({ from: peerId, to: me, status: 'pending' }).lean();
     const messages = await loadDmLines(me, peerId);
@@ -2306,6 +2358,13 @@ router.post('/chats/:peerId/messages', authenticateToken, optionalChatFile, asyn
     if (!text && !media) return res.status(400).json({ error: 'Escribe un mensaje o adjunta una foto' });
     if (!mongoose.isValidObjectId(peerId) || me === peerId) {
       return res.status(400).json({ error: 'Destinatario inválido' });
+    }
+    const blockedSend = await blockBetween(me, peerId);
+    if (blockedSend === 'them') {
+      return res.status(403).json({ error: 'Te ha bloqueado', blocked: 'them' });
+    }
+    if (blockedSend === 'you') {
+      return res.status(403).json({ error: 'Has bloqueado a esta persona', blocked: 'you' });
     }
     const peer = await User.findById(peerId).select('_id').lean();
     if (!peer) return res.status(404).json({ error: 'Usuario no encontrado' });

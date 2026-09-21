@@ -10,6 +10,7 @@ import authRoutes from './routes/auth';
 import routinesRoutes from './routes/routines';
 import trainingMaxesRoutes from './routes/trainingMaxes';
 import socialRoutes from './routes/social';
+import privacyRoutes from './routes/privacy';
 import checkinsRoutes from './routes/checkins';
 import notificationsRoutes from './routes/notifications';
 import challengesRoutes from './routes/challenges';
@@ -78,6 +79,7 @@ app.use('/api', (req, res, next) => {
 app.use('/api/auth', authRoutes);
 app.use('/api/routines', routinesRoutes);
 app.use('/api/training-maxes', trainingMaxesRoutes);
+app.use('/api/social', privacyRoutes);
 app.use('/api/social', socialRoutes);
 app.use('/api/checkins', checkinsRoutes);
 app.use('/api/notifications', notificationsRoutes);
@@ -170,6 +172,8 @@ const startServer = async () => {
       const { ensureStoryTtlGrace, startStoryCleanup } = await import('./utils/storyCleanup');
       await ensureStoryTtlGrace().catch(e => logger.warn('TTL de historias', e));
       startStoryCleanup();
+      const { startWorkoutReminders } = await import('./utils/workoutReminder');
+      startWorkoutReminders();
       await migrateInlineAvatars().catch((e) => logger.warn('Migración de avatares', e));
     };
 

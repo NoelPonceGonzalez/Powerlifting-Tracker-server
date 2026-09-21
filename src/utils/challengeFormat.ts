@@ -33,6 +33,7 @@ export function formatChallengeDoc(c: any) {
     exercise: exerciseLabel(c.exercise, exercises) || c.exercise,
     exercises,
     isPrivate: !!c.isPrivate,
+    closeFriendsOnly: !!c.closeFriendsOnly,
     usePointsSystem: c.usePointsSystem !== false,
     bodyWeightScoring: normalizeBodyWeightScoring(c.bodyWeightScoring),
     createdAt: createdAt ? new Date(createdAt).toISOString() : undefined,

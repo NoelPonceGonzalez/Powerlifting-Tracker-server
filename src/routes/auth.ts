@@ -5,7 +5,8 @@ import { User } from '../models/User';
 import { PendingSignup, IPendingSignup } from '../models/PendingSignup';
 import { sendVerificationEmail, sendPasswordResetEmail } from '../utils/email';
 import { hashPassword, comparePassword } from '../utils/crypto';
-import { generateToken, authenticateToken, AuthRequest } from '../middleware/auth';
+import { issueToken, authenticateToken, authenticateAllowExpired, AuthRequest } from '../middleware/auth';
+import { authBurstLimit } from '../middleware/rateLimit';
 import { logger } from '../utils/logger';
 import { config, getPublicWebBaseUrl } from '../config/env';
 import {
@@ -23,7 +24,7 @@ const avatarUpload = multer({
 
 /** Login sin avatar ni tokens de push: un data: enorme en Mongo hacía que el fetch saltara por timeout. */
 const LOGIN_SELECT =
-  'email username password name gender bodyWeight theme progressMode mbMode emailVerified';
+  'email username password name gender bodyWeight theme progressMode mbMode emailVerified workoutReminderOn workoutReminderTime timezone';
 
 const router = express.Router();
 
@@ -78,6 +79,7 @@ const generateNumericVerificationCode = (): string => {
 // 1. Registro inicial (solo email)
 router.post(
   '/register',
+  authBurstLimit,
   [
     body('email')
       .trim()
@@ -696,7 +698,7 @@ router.post(
       await PendingSignup.deleteOne({ _id: pending._id });
 
       // Generar token JWT
-      const jwtToken = generateToken(user._id.toString(), user.email);
+      const jwtToken = await issueToken(user._id.toString(), user.email);
 
       res.json({
         message: 'Registro completado exitosamente',
@@ -739,6 +741,7 @@ router.post(
 // 4. Login por nombre de usuario
 router.post(
   '/login',
+  authBurstLimit,
   [
     body('username')
       .trim()
@@ -865,7 +868,7 @@ router.post(
       logger.info('POST /login - Generando token JWT');
       let jwtToken;
       try {
-        jwtToken = generateToken(user._id.toString(), user.email);
+        jwtToken = await issueToken(user._id.toString(), user.email);
         logger.info('POST /login - Token JWT generado exitosamente');
       } catch (tokenError: any) {
         logger.error('POST /login - Error generando token JWT', tokenError);
@@ -949,6 +952,9 @@ router.get('/me', authenticateToken, async (req: AuthRequest, res: Response) => 
         progressMode: user.progressMode ?? undefined,
         mbMode: !!user.mbMode,
         emailVerified: user.emailVerified,
+        workoutReminderOn: user.workoutReminderOn !== false,
+        workoutReminderTime: user.workoutReminderTime || '10:00',
+        timezone: user.timezone || 'Europe/Madrid',
       }
     });
   } catch (error: any) {
@@ -982,6 +988,31 @@ router.post('/logout', authenticateToken, async (req: Request, res: Response) =>
   res.json({ message: 'Logout exitoso' });
 });
 
+router.post('/refresh', authenticateAllowExpired, async (req: AuthRequest, res: Response) => {
+  try {
+    const userId = String(req.userId || req.user?.userId || '');
+    const email = String(req.user?.email || '');
+    if (!userId) return res.status(401).json({ error: 'Token de acceso requerido' });
+    const token = await issueToken(userId, email);
+    res.json({ token });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message || 'No se pudo renovar' });
+  }
+});
+
+router.post('/logout-others', authenticateToken, async (req: AuthRequest, res: Response) => {
+  try {
+    const userId = String(req.userId || req.user?.userId || '');
+    const email = String(req.user?.email || '');
+    if (!userId) return res.status(401).json({ error: 'Token de acceso requerido' });
+    await User.updateOne({ _id: userId }, { $inc: { sessionVersion: 1 } });
+    const token = await issueToken(userId, email);
+    res.json({ token, ok: true });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message || 'No se han podido cerrar las otras sesiones' });
+  }
+});
+
 // 7. Actualizar usuario (apariencia/theme, nombre, bodyWeight, etc.)
 router.put('/me', authenticateToken, async (req: AuthRequest, res: Response) => {
   try {
@@ -989,7 +1020,7 @@ router.put('/me', authenticateToken, async (req: AuthRequest, res: Response) => 
     if (!user) {
       return res.status(404).json({ error: 'Usuario no encontrado' });
     }
-    const { theme, name, bodyWeight, avatar, progressMode, mbMode, gender } = req.body;
+    const { theme, name, bodyWeight, avatar, progressMode, mbMode, gender, workoutReminderOn, workoutReminderTime, timezone } = req.body;
     if (theme !== undefined) {
       if (theme === 'light' || theme === 'dark') {
         user.theme = theme;
@@ -1023,6 +1054,14 @@ router.put('/me', authenticateToken, async (req: AuthRequest, res: Response) => 
     if (mbMode !== undefined) {
       user.mbMode = !!mbMode;
     }
+    if (workoutReminderOn !== undefined) user.workoutReminderOn = !!workoutReminderOn;
+    if (typeof workoutReminderTime === 'string' && /^\d{1,2}:\d{2}$/.test(workoutReminderTime.trim())) {
+      const [h, m] = workoutReminderTime.trim().split(':');
+      user.workoutReminderTime = `${String(Math.min(23, parseInt(h, 10))).padStart(2, '0')}:${String(Math.min(59, parseInt(m, 10))).padStart(2, '0')}`;
+    }
+    if (typeof timezone === 'string' && timezone.trim().length > 2 && timezone.length < 80) {
+      user.timezone = timezone.trim();
+    }
     await user.save();
     const avatarOut = await publicUserAvatar(user._id);
     res.json({
@@ -1038,6 +1077,9 @@ router.put('/me', authenticateToken, async (req: AuthRequest, res: Response) => 
         progressMode: user.progressMode ?? undefined,
         mbMode: !!user.mbMode,
         emailVerified: user.emailVerified,
+        workoutReminderOn: user.workoutReminderOn !== false,
+        workoutReminderTime: user.workoutReminderTime || '10:00',
+        timezone: user.timezone || 'Europe/Madrid',
       },
     });
   } catch (error: any) {
@@ -1061,6 +1103,9 @@ function loginUserPayload(
     theme: user.theme ?? undefined,
     progressMode: user.progressMode ?? undefined,
     mbMode: !!user.mbMode,
+    workoutReminderOn: (user as { workoutReminderOn?: boolean }).workoutReminderOn !== false,
+    workoutReminderTime: (user as { workoutReminderTime?: string }).workoutReminderTime || '10:00',
+    timezone: (user as { timezone?: string }).timezone || 'Europe/Madrid',
   };
 }
 
@@ -1082,6 +1127,7 @@ async function publicUserAvatar(userId: unknown): Promise<string> {
 
 router.post(
   '/forgot-password',
+  authBurstLimit,
   [
     body('email')
       .trim()
@@ -1165,6 +1211,7 @@ router.post(
 
 router.post(
   '/reset-password',
+  authBurstLimit,
   [
     body('email')
       .trim()
@@ -1202,7 +1249,7 @@ router.post(
       user.resetPasswordExpires = undefined;
       await user.save();
 
-      const jwtToken = generateToken(user._id.toString(), user.email);
+      const jwtToken = await issueToken(user._id.toString(), user.email);
       const avatar = await publicUserAvatar(user._id);
       return res.json({
         message: 'Contraseña actualizada',

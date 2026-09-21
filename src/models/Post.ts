@@ -15,6 +15,8 @@ export interface IPost extends Document {
   /** Quién ha visto la historia; solo lo ve su autor. */
   views: mongoose.Types.ObjectId[];
   commentCount: number;
+  /** all = quien te sigue; close = solo mejores amigos. */
+  audience?: 'all' | 'close';
   /** Solo historias: Mongo las borra sola a las 24 h. */
   expiresAt?: Date;
   createdAt: Date;
@@ -32,6 +34,7 @@ const PostSchema = new Schema<IPost>(
     likes: [{ type: Schema.Types.ObjectId, ref: 'User' }],
     views: [{ type: Schema.Types.ObjectId, ref: 'User' }],
     commentCount: { type: Number, default: 0 },
+    audience: { type: String, enum: ['all', 'close'], default: 'all' },
     expiresAt: { type: Date },
   },
   { timestamps: true }

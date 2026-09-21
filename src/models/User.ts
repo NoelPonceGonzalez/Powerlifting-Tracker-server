@@ -21,6 +21,18 @@ export interface IUser extends Document {
   resetPasswordExpires?: Date;
   /** Tokens Expo por dispositivo (varios móviles/tablets por cuenta). */
   pushTokens?: string[];
+  /** Lista única de mejores amigos (historias, gym y torneos). */
+  closeFriendIds?: mongoose.Types.ObjectId[];
+  /** A quién he bloqueado. */
+  blockedUserIds?: mongoose.Types.ObjectId[];
+  /** Sube al cerrar otras sesiones; el JWT lleva este número. */
+  sessionVersion?: number;
+  workoutReminderOn?: boolean;
+  /** HH:MM en la zona del usuario. */
+  workoutReminderTime?: string;
+  timezone?: string;
+  /** Día civil (YYYY-MM-DD) del último recordatorio enviado. */
+  workoutReminderDate?: string;
   /** Suscripciones Web Push (PWA / Chrome / Safari instalado). */
   webPushSubscriptions?: {
     endpoint: string;
@@ -106,6 +118,13 @@ const UserSchema = new Schema<IUser>(
       type: [String],
       default: [],
     },
+    closeFriendIds: [{ type: Schema.Types.ObjectId, ref: 'User' }],
+    blockedUserIds: [{ type: Schema.Types.ObjectId, ref: 'User' }],
+    sessionVersion: { type: Number, default: 0 },
+    workoutReminderOn: { type: Boolean, default: true },
+    workoutReminderTime: { type: String, default: '10:00' },
+    timezone: { type: String, default: 'Europe/Madrid' },
+    workoutReminderDate: { type: String, default: '' },
     webPushSubscriptions: {
       type: [
         {

@@ -26,6 +26,8 @@ export interface IChallenge extends Document {
   /** Uno o varios (SBD, etc.). `exercise` se guarda como texto unido por compatibilidad. */
   exercises?: string[];
   isPrivate?: boolean;
+  /** Solo lo ven (y pueden unirse) los mejores amigos del creador. */
+  closeFriendsOnly?: boolean;
   passwordHash?: string;
   /** Si false, el ranking usa la marca bruta (kg / reps / s). Si true, IPF GL (peso) y fórmulas por peso/género (reps/seg). */
   usePointsSystem: boolean;
@@ -107,6 +109,10 @@ const ChallengeSchema = new Schema<IChallenge>(
       default: undefined,
     },
     isPrivate: {
+      type: Boolean,
+      default: false,
+    },
+    closeFriendsOnly: {
       type: Boolean,
       default: false,
     },

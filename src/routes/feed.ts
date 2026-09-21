@@ -10,6 +10,7 @@ import { User } from '../models/User';
 import { ChatMessage } from '../models/ChatMessage';
 import { isSupportedMediaType, mediaKindFromMime, mediaStorage } from '../utils/mediaStorage';
 import { canSeeContent, circleIds } from '../utils/friendship';
+import { blockBetween, blockedIdsFor, canSeeCloseAudience } from '../utils/privacy';
 import { broadcastSse } from '../utils/sse';
 import { chatIsOpen, ensurePendingChatRequest } from '../utils/chatAccess';
 import { publicListAvatar } from '../utils/avatarMedia';
@@ -83,6 +84,7 @@ router.post(
 
       const kind = String(req.body.kind || 'story') === 'post' ? 'post' : 'story';
       const caption = String(req.body.caption || '').trim().slice(0, 2200);
+      const audience = String(req.body.audience || 'all') === 'close' ? 'close' : 'all';
       const stored = await mediaStorage().save(file.buffer, file.mimetype);
 
       const post = await Post.create({
@@ -92,6 +94,7 @@ router.post(
         mediaKey: stored.key,
         mimeType: stored.mimeType,
         caption,
+        audience,
         likes: [],
         commentCount: 0,
         ...(kind === 'story' ? { expiresAt: new Date(Date.now() + STORY_LIFETIME_MS) } : {}),
@@ -146,14 +149,21 @@ router.get('/stories', authenticateToken, async (req: Request, res: Response) =>
       .populate('likes', 'name avatar')
       .lean();
 
+    const hidden = await blockedIdsFor(String(userId));
     const authorIds = [...new Set(stories.map(s => String((s.userId as any)?._id ?? s.userId)))];
     const authors = authorIds.length
-      ? await User.find({ _id: { $in: authorIds } }).select('name avatar').lean()
+      ? await User.find({ _id: { $in: authorIds } }).select('name avatar closeFriendIds').lean()
       : [];
     const authorById = new Map(authors.map(u => [String(u._id), u]));
+    const visibleStories = stories.filter(s => {
+      const uid = String((s.userId as any)?._id ?? s.userId);
+      if (hidden.has(uid) && uid !== String(userId)) return false;
+      const close = new Set((authorById.get(uid)?.closeFriendIds || []).map((id: unknown) => String(id)));
+      return canSeeCloseAudience(String(userId), uid, (s as any).audience, close);
+    });
 
     const byAuthor = new Map<string, { author: ReturnType<typeof authorOf>; items: any[] }>();
-    stories.forEach(s => {
+    visibleStories.forEach(s => {
       const uid = String((s.userId as any)?._id ?? s.userId);
       const author = authorOf(authorById.get(uid) || s.userId);
       if (!byAuthor.has(author.id)) byAuthor.set(author.id, { author, items: [] });
@@ -180,8 +190,12 @@ router.get('/users/:userId/posts', authenticateToken, async (req: Request, res: 
     const viewerId = (req as any).user.userId;
     const target = req.params.userId;
     if (!mongoose.isValidObjectId(target)) return res.status(400).json({ error: 'Usuario inválido' });
-    if (!(await canSeeContent(viewerId, target))) {
-      return res.status(403).json({ error: 'Solo puedes ver las publicaciones de a quien sigues' });
+    const blocked = await blockBetween(String(viewerId), String(target));
+    if (blocked === 'them') {
+      return res.status(403).json({ error: 'Te ha bloqueado', blocked: 'them' });
+    }
+    if (blocked === 'you') {
+      return res.status(403).json({ error: 'Has bloqueado a esta persona', blocked: 'you' });
     }
 
     const posts = await Post.find({ userId: target, kind: 'post' })

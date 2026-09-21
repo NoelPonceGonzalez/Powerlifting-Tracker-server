@@ -4,6 +4,7 @@ import bcrypt from 'bcryptjs';
 import { authenticateToken } from '../middleware/auth';
 import { Challenge } from '../models/Challenge';
 import { mutualFriendIds } from '../utils/friendship';
+import { audienceRecipients, blockedIdsFor, loadPrivacy } from '../utils/privacy';
 import { User } from '../models/User';
 import { Notification } from '../models/Notification';
 import { body, validationResult } from 'express-validator';
@@ -60,7 +61,32 @@ router.get('/', authenticateToken, async (req: Request, res: Response) => {
       .populate('participants.userId', 'name email avatar bodyWeight gender')
       .sort({ endDate: 1 });
 
-    for (const c of challenges) {
+    const hidden = await blockedIdsFor(String(userId));
+    const closeOnlyCreators = [
+      ...new Set(
+        challenges
+          .filter(c => c.closeFriendsOnly)
+          .map(c => String((c.createdBy as any)?._id ?? c.createdBy))
+      ),
+    ];
+    const closeDocs = closeOnlyCreators.length
+      ? await User.find({ _id: { $in: closeOnlyCreators } }).select('closeFriendIds').lean()
+      : [];
+    const closeByCreator = new Map(
+      closeDocs.map(u => [String(u._id), new Set((u.closeFriendIds || []).map((id: unknown) => String(id)))])
+    );
+    const visible = challenges.filter(c => {
+      const creatorId = String((c.createdBy as any)?._id ?? c.createdBy);
+      if (hidden.has(creatorId) && creatorId !== String(userId)) return false;
+      if (c.participants.some(p => participantUserIdString(p) === String(userId))) return true;
+      if (creatorId === String(userId)) return true;
+      if (c.closeFriendsOnly && !(closeByCreator.get(creatorId) || new Set()).has(String(userId))) {
+        return false;
+      }
+      return true;
+    });
+
+    for (const c of visible) {
       let dirty = false;
       for (const p of c.participants) {
         if (p.initialRank != null || !(p.value > 0)) continue;
@@ -73,7 +99,7 @@ router.get('/', authenticateToken, async (req: Request, res: Response) => {
       if (dirty) void c.save();
     }
 
-    res.json(challenges.map((c) => formatChallengeDoc(c)));
+    res.json(visible.map((c) => formatChallengeDoc(c)));
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -106,6 +132,7 @@ router.post(
       }
       const exerciseText = exerciseLabel(exercise, exercises);
       const isPrivate = req.body.isPrivate === true || req.body.isPrivate === 'true';
+      const closeFriendsOnly = req.body.closeFriendsOnly === true || req.body.closeFriendsOnly === 'true';
       const rawPassword = typeof req.body.password === 'string' ? req.body.password.trim() : '';
       if (isPrivate && rawPassword.length < 4) {
         return res.status(400).json({ error: 'La contraseña del torneo privado debe tener al menos 4 caracteres' });
@@ -126,6 +153,7 @@ router.post(
         exercise: exerciseText,
         exercises,
         isPrivate,
+        closeFriendsOnly,
         passwordHash: isPrivate ? await bcrypt.hash(rawPassword, 10) : '',
         usePointsSystem,
         bodyWeightScoring,
@@ -145,7 +173,12 @@ router.post(
 
       await challenge.save();
 
-      const friendIds = await getFriendIds(userId);
+      const friendIdsRaw = await getFriendIds(userId);
+      const friendIds = (await audienceRecipients(
+        String(userId),
+        closeFriendsOnly ? 'close' : 'all',
+        friendIdsRaw.map(id => id.toString())
+      )).map(id => new mongoose.Types.ObjectId(id));
       const notifTitle = isPrivate ? 'Torneo privado' : 'Nuevo torneo creado';
       const notifBody = isPrivate
         ? `${creatorName} ha creado «${title}». Pídele la contraseña para unirte.`
@@ -218,9 +251,16 @@ router.put(
       );
 
       if (!isCreator) {
-        const friendIds = await getFriendIds(creatorId);
-        if (!friendIds.some(id => id.toString() === userId)) {
-          return res.status(403).json({ error: 'Solo los amigos del creador pueden unirse a este torneo' });
+        if (challenge.closeFriendsOnly) {
+          const { close } = await loadPrivacy(creatorId);
+          if (!close.has(String(userId))) {
+            return res.status(403).json({ error: 'Este torneo es solo para mejores amigos' });
+          }
+        } else {
+          const friendIds = await getFriendIds(creatorId);
+          if (!friendIds.some(id => id.toString() === userId)) {
+            return res.status(403).json({ error: 'Solo los amigos del creador pueden unirse a este torneo' });
+          }
         }
       }
 

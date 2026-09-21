@@ -1,8 +1,24 @@
 import express, { Request, Response } from 'express';
 import mongoose from 'mongoose';
+import jwt from 'jsonwebtoken';
 import { User } from '../models/User';
 import { isAvatarMediaKey, isInlineAvatar } from '../utils/avatarMedia';
 import { mediaStorage } from '../utils/mediaStorage';
+import { config } from '../config/env';
+
+function mediaTokenOk(req: Request): boolean {
+  const header = String(req.headers.authorization || '');
+  const bearer = header.startsWith('Bearer ') ? header.slice(7) : '';
+  const q = typeof req.query.t === 'string' ? req.query.t : '';
+  const token = bearer || q;
+  if (!token) return false;
+  try {
+    jwt.verify(token, config.jwtSecret);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 const router = express.Router();
 
@@ -28,7 +44,10 @@ router.get('/user/:userId', async (req: Request, res: Response) => {
     }
 
     if (isAvatarMediaKey(raw) || /^\d{6}\/[-\w.]+\.[a-z0-9]+$/i.test(raw)) {
-      const found = await mediaStorage().read(raw);
+      const storage = mediaStorage();
+      const direct = await storage.publicUrl(raw);
+      if (direct) return res.redirect(302, direct);
+      const found = await storage.read(raw);
       if (!found) return res.status(404).end();
       res.setHeader('Content-Type', found.mimeType);
       res.setHeader('Cache-Control', 'private, max-age=86400');
@@ -43,14 +62,19 @@ router.get('/user/:userId', async (req: Request, res: Response) => {
 });
 
 /**
- * Sirve fotos y vídeos del feed. Va sin token a propósito: las etiquetas `<img>` y `<video>` no
- * pueden mandar cabeceras, y la clave es un UUID imposible de adivinar. Admite rangos para que
- * el reproductor pueda avanzar el vídeo sin descargarlo entero.
+ * Historias/chat: el `<img>` no manda cabecera, así que el JWT va en `?t=`.
+ * Los avatares `/user/:id` siguen públicos (salen en búsqueda).
  */
 router.get('/:folder/:file', async (req: Request, res: Response) => {
   try {
+    const requireJwt = process.env.MEDIA_REQUIRE_JWT === '1' || process.env.MEDIA_REQUIRE_JWT === 'true';
+    if (requireJwt && !mediaTokenOk(req)) {
+      return res.status(401).json({ error: 'Token de acceso requerido' });
+    }
     const key = `${req.params.folder}/${req.params.file}`;
     const storage = mediaStorage();
+    const direct = await storage.publicUrl(key);
+    if (direct) return res.redirect(302, direct);
     const rangeHeader = req.headers.range;
 
     if (rangeHeader) {

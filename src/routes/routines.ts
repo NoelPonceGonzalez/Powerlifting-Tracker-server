@@ -108,6 +108,12 @@ router.post(
         sameTemplateAllWeeks: parseSameTemplateAllWeeks(req.body.sameTemplateAllWeeks),
         hiddenFromSocial: !!req.body.hiddenFromSocial,
         cycleLength: Number.isFinite(req.body.cycleLength) ? Math.max(1, Math.min(52, req.body.cycleLength)) : 4,
+        cycleAnchorISO: typeof req.body.cycleAnchorISO === 'string' && /^\d{4}-\d{2}-\d{2}/.test(req.body.cycleAnchorISO)
+          ? req.body.cycleAnchorISO.slice(0, 10)
+          : undefined,
+        weekStartsOn: Number.isFinite(req.body.weekStartsOn)
+          ? Math.max(0, Math.min(6, Math.round(req.body.weekStartsOn)))
+          : 1,
         skippedWeeks: Array.isArray(req.body.skippedWeeks)
           ? req.body.skippedWeeks.filter((w: unknown) => typeof w === 'number' && Number.isFinite(w))
           : [],
@@ -166,6 +172,12 @@ router.patch('/:id/plan', authenticateToken, async (req: Request, res: Response)
     if (hiddenFromSocial !== undefined) routine.hiddenFromSocial = !!hiddenFromSocial;
     if (req.body.cycleLength !== undefined && Number.isFinite(req.body.cycleLength)) {
       (routine as any).cycleLength = Math.max(1, Math.min(52, req.body.cycleLength));
+    }
+    if (typeof req.body.cycleAnchorISO === 'string' && /^\d{4}-\d{2}-\d{2}/.test(req.body.cycleAnchorISO)) {
+      (routine as any).cycleAnchorISO = req.body.cycleAnchorISO.slice(0, 10);
+    }
+    if (req.body.weekStartsOn !== undefined && Number.isFinite(req.body.weekStartsOn)) {
+      (routine as any).weekStartsOn = Math.max(0, Math.min(6, Math.round(req.body.weekStartsOn)));
     }
     if (Array.isArray(req.body.skippedWeeks)) {
       (routine as any).skippedWeeks = req.body.skippedWeeks.filter((w: any) => Number.isFinite(w));
@@ -536,6 +548,12 @@ router.put(
       if (hiddenFromSocial !== undefined) routine.hiddenFromSocial = !!hiddenFromSocial;
       if (req.body.cycleLength !== undefined && Number.isFinite(req.body.cycleLength)) {
         (routine as any).cycleLength = Math.max(1, Math.min(52, req.body.cycleLength));
+      }
+      if (typeof req.body.cycleAnchorISO === 'string' && /^\d{4}-\d{2}-\d{2}/.test(req.body.cycleAnchorISO)) {
+        (routine as any).cycleAnchorISO = req.body.cycleAnchorISO.slice(0, 10);
+      }
+      if (req.body.weekStartsOn !== undefined && Number.isFinite(req.body.weekStartsOn)) {
+        (routine as any).weekStartsOn = Math.max(0, Math.min(6, Math.round(req.body.weekStartsOn)));
       }
       if (Array.isArray(req.body.skippedWeeks)) {
         (routine as any).skippedWeeks = req.body.skippedWeeks.filter((w: any) => Number.isFinite(w));

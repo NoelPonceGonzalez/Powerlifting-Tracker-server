@@ -55,6 +55,47 @@ function formatMeta(meta: unknown): string {
   }
 }
 
+const MAX_SERVER_LOG = 1.5 * 1024 * 1024;
+const MAX_ERROR_LOG = 256 * 1024;
+const MAX_PM2_LOG = 1024 * 1024;
+
+function trimFileTo(filePath: string, maxBytes: number): boolean {
+  try {
+    if (!fs.existsSync(filePath)) return false;
+    const size = fs.statSync(filePath).size;
+    if (size <= maxBytes) return false;
+    const keep = Math.floor(maxBytes * 0.65);
+    const fd = fs.openSync(filePath, 'r');
+    const buf = Buffer.alloc(keep);
+    fs.readSync(fd, buf, 0, keep, size - keep);
+    fs.closeSync(fd);
+    const cut = buf.indexOf(0x0a);
+    const body = cut >= 0 && cut < keep - 1 ? buf.subarray(cut + 1) : buf;
+    fs.writeFileSync(filePath, Buffer.concat([Buffer.from(`[${getTimestamp()}] [INFO] Log recortado (quedan las últimas líneas)\n`), body]));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Recorta server.log, errors.log y los de PM2 para que no crezcan sin tope. */
+export function sweepAppLogs(): number {
+  const home = process.env.HOME || '';
+  const files: Array<[string, number]> = [
+    [LOG_FILE, MAX_SERVER_LOG],
+    [ERROR_FILE, MAX_ERROR_LOG],
+    [path.join(home, '.pm2/logs/powerlifting-out.log'), MAX_PM2_LOG],
+    [path.join(home, '.pm2/logs/powerlifting-error.log'), MAX_PM2_LOG],
+    [path.join(home, '.pm2/logs/api-tunnel-out.log'), MAX_PM2_LOG],
+    [path.join(home, '.pm2/logs/api-tunnel-error.log'), MAX_PM2_LOG],
+  ];
+  let n = 0;
+  for (const [file, max] of files) {
+    if (trimFileTo(file, max)) n += 1;
+  }
+  return n;
+}
+
 export const logger = {
   /** Un solo renglón en consola; el segundo argumento va compacto (sin pretty-print de páginas enteras). */
   info: (message: string, meta?: unknown) => {

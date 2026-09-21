@@ -5,6 +5,8 @@ import { Notification } from '../models/Notification';
 import { body, validationResult } from 'express-validator';
 import { broadcastSse } from '../utils/sse';
 import { circleIds, followerIds } from '../utils/friendship';
+import { audienceRecipients, blockedIdsFor, canSeeCloseAudience } from '../utils/privacy';
+import { User } from '../models/User';
 import { publicListAvatar } from '../utils/avatarMedia';
 
 const router = express.Router();
@@ -27,6 +29,7 @@ router.post(
       const userId = String((req as any).user?.userId ?? (req as any).userId ?? '');
       const userName = (req as any).user?.name || (req as any).user?.email || 'Usuario';
       const { gymName, time } = req.body;
+      const audience = String(req.body.audience || 'all') === 'close' ? 'close' : 'all';
 
       if (!userId) {
         return res.status(401).json({ error: 'Usuario no autenticado' });
@@ -51,6 +54,7 @@ router.post(
         existingToday.gymName = gymName;
         existingToday.time = time;
         existingToday.timestamp = now;
+        existingToday.audience = audience;
         await existingToday.save();
         checkIn = existingToday;
       } else {
@@ -59,13 +63,14 @@ router.post(
           userName,
           gymName,
           time,
+          audience,
           timestamp: now,
         });
         await checkIn.save();
         isNewCheckIn = true;
       }
 
-      const friendIds = await followerIds(userId);
+      const friendIds = await audienceRecipients(userId, audience, await followerIds(userId));
 
       // Crear notificaciones in-app y push para todos los amigos
       if (friendIds.length > 0 && isNewCheckIn) {
@@ -134,11 +139,18 @@ router.put(
       const oldGymName = checkIn.gymName;
       if (gymName !== undefined) checkIn.gymName = gymName;
       if (time !== undefined) checkIn.time = time;
+      if (req.body.audience === 'close' || req.body.audience === 'all') {
+        checkIn.audience = req.body.audience;
+      }
       checkIn.userName = userName;
       checkIn.timestamp = new Date();
       await checkIn.save();
 
-      const friendIds = await followerIds(userId);
+      const friendIds = await audienceRecipients(
+        userId,
+        (checkIn.audience === 'close' ? 'close' : 'all'),
+        await followerIds(userId)
+      );
 
       const editedTime = time !== undefined && time !== oldTime;
       const editedGym = gymName !== undefined && gymName !== oldGymName;
@@ -210,8 +222,26 @@ router.get('/', authenticateToken, async (req: Request, res: Response) => {
       .sort({ timestamp: -1 })
       .limit(50);
 
+    const hidden = await blockedIdsFor(String(userId));
+    const closeAuthors = await User.find({
+      _id: { $in: [...new Set(checkIns.map(ci => String((ci.userId as any)?._id ?? ci.userId)))] },
+    })
+      .select('closeFriendIds')
+      .lean();
+    const closeByAuthor = new Map(
+      closeAuthors.map(u => [String(u._id), new Set((u.closeFriendIds || []).map((id: unknown) => String(id)))])
+    );
+
     const seenByUserAndDay = new Set<string>();
     const formatted = checkIns
+      .filter(ci => {
+        const rawUserId = typeof ci.userId === 'object' ? (ci.userId as any)._id?.toString?.() || (ci.userId as any).toString?.() : String(ci.userId);
+        if (hidden.has(rawUserId) && rawUserId !== String(userId)) return false;
+        if (!canSeeCloseAudience(String(userId), rawUserId, (ci as any).audience, closeByAuthor.get(rawUserId) || new Set())) {
+          return false;
+        }
+        return true;
+      })
       .filter(ci => {
         const rawUserId = typeof ci.userId === 'object' ? (ci.userId as any)._id?.toString?.() || (ci.userId as any).toString?.() : String(ci.userId);
         const day = ci.timestamp.toISOString().slice(0, 10);
