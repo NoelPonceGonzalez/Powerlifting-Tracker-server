@@ -191,6 +191,22 @@ function asObjectIds(ids: Iterable<string>) {
   return out;
 }
 
+async function sampleDiscoverUsers(exclude: Set<string>, limit: number) {
+  const excludeIds = asObjectIds(exclude);
+  const match = { _id: { $nin: excludeIds }, ...REGISTERED_USER_MATCH };
+  try {
+    const sampled = await User.aggregate([
+      { $match: match },
+      { $sample: { size: limit } },
+      { $project: { name: 1, email: 1, username: 1, avatar: 1, bodyWeight: 1 } },
+    ]);
+    if (sampled.length > 0) return sampled;
+  } catch {
+    // En clústeres pequeños $sample a veces falla; caemos a find.
+  }
+  return User.find(match).select('name email username avatar bodyWeight').sort({ createdAt: -1 }).limit(limit).lean();
+}
+
 /** Sugerencias para seguir: te siguen, amigos de amigos, y gente nueva. Cambian en cada carga. */
 router.get('/suggestions', authenticateToken, async (req: Request, res: Response) => {
   try {
@@ -234,11 +250,10 @@ router.get('/suggestions', authenticateToken, async (req: Request, res: Response
     const friendIds = shuffleIds([...fofSet]).slice(0, 8);
 
     const taken = new Set<string>([...exclude, ...followBackIds, ...friendIds]);
-    const discoverUsers = await User.aggregate([
-      { $match: { _id: { $nin: asObjectIds(taken) }, ...REGISTERED_USER_MATCH } },
-      { $sample: { size: 8 } },
-      { $project: { name: 1, email: 1, username: 1, avatar: 1, bodyWeight: 1 } },
-    ]);
+    let discoverUsers = await sampleDiscoverUsers(taken, 12);
+    if (discoverUsers.length === 0) {
+      discoverUsers = await sampleDiscoverUsers(new Set([userIdOid.toString()]), 12);
+    }
 
     const needed = [...new Set([...followBackIds, ...friendIds])];
     const knownUsers =
