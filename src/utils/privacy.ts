@@ -1,6 +1,10 @@
 import mongoose from 'mongoose';
+import { CoachRequest } from '../models/CoachRequest';
 import { Friendship } from '../models/Friendship';
+import { Notification } from '../models/Notification';
 import { User } from '../models/User';
+import { wipeDmBothSides } from './chatAccess';
+import { broadcastSse } from './sse';
 
 function idStr(v: unknown) {
   return String((v as { toString?: () => string })?.toString?.() ?? v ?? '');
@@ -54,12 +58,29 @@ export async function audienceRecipients(
 export async function applyBlock(me: string, target: string) {
   if (me === target) throw new Error('No puedes bloquearte a ti');
   const other = new mongoose.Types.ObjectId(target);
+  const meOid = new mongoose.Types.ObjectId(me);
   await User.updateOne({ _id: me }, { $addToSet: { blockedUserIds: other }, $pull: { closeFriendIds: other } });
-  await User.updateOne({ _id: target }, { $pull: { closeFriendIds: new mongoose.Types.ObjectId(me) } });
+  await User.updateOne({ _id: target }, { $pull: { closeFriendIds: meOid } });
+  await User.updateOne({ _id: me, coachId: other }, { $unset: { coachId: 1 } });
+  await User.updateOne({ _id: target, coachId: meOid }, { $unset: { coachId: 1 } });
   await Friendship.deleteMany({
     $or: [
       { requester: me, recipient: target },
       { requester: target, recipient: me },
     ],
   });
+  await CoachRequest.deleteMany({
+    $or: [
+      { athlete: me, coach: target },
+      { athlete: target, coach: me },
+    ],
+  });
+  await Notification.deleteMany({
+    $or: [
+      { userId: me, relatedUserId: target },
+      { userId: target, relatedUserId: me },
+    ],
+  });
+  await wipeDmBothSides(me, target);
+  broadcastSse([me, target], 'social_update');
 }

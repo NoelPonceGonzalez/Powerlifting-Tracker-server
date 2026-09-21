@@ -23,7 +23,9 @@ import { broadcastSse, isUserOnline } from '../utils/sse';
 import { isSupportedMediaType, mediaKindFromMime, mediaStorage } from '../utils/mediaStorage';
 import { chatMediaExpiresAt, isChatMediaLive } from '../utils/chatMedia';
 import { areFriends, connectionSets, describeRelation, follows, loadPair, mutualFriendIds } from '../utils/friendship';
-import { blockBetween, blockedIdsFor, loadPrivacy } from '../utils/privacy';
+import { blockBetween, blockedIdsFor, canSeeCloseAudience, loadPrivacy } from '../utils/privacy';
+import { Challenge } from '../models/Challenge';
+import { GymCheckIn } from '../models/GymCheckIn';
 import { chatIsOpen, ensurePendingChatRequest, wipeDmBothSides } from '../utils/chatAccess';
 import { publicListAvatar } from '../utils/avatarMedia';
 
@@ -250,24 +252,29 @@ router.get('/suggestions', authenticateToken, async (req: Request, res: Response
       circleIds.length === 0
         ? []
         : await Friendship.find({
-            requester: { $in: circleIds },
             status: 'accepted',
+            $or: [{ requester: { $in: circleIds } }, { recipient: { $in: circleIds } }],
           })
-            .select('recipient')
+            .select('requester recipient')
             .lean();
 
     const fofSet = new Set<string>();
+    const me = userIdOid.toString();
     for (const row of theirFollows) {
-      const other = String(row.recipient);
-      if (!exclude.has(other) && !followBackIds.includes(other)) fofSet.add(other);
+      for (const other of [String(row.requester), String(row.recipient)]) {
+        if (!other || other === me) continue;
+        if (exclude.has(other) || followBackIds.includes(other)) continue;
+        fofSet.add(other);
+      }
     }
     const friendIds = shuffleIds([...fofSet]).slice(0, 8);
 
     const taken = new Set<string>([...exclude, ...followBackIds, ...friendIds]);
-    let discoverUsers = await sampleDiscoverUsers(taken, 12);
-    if (discoverUsers.length === 0) {
-      discoverUsers = await sampleDiscoverUsers(new Set([userIdOid.toString()]), 12);
-    }
+    // Nunca relajar `taken`: si no queda nadie nuevo, la lista va vacía.
+    // El fallback anterior volvía a meter a gente que ya sigues o con solicitud pendiente.
+    const discoverUsers = (await sampleDiscoverUsers(taken, 12)).filter(
+      (user: { _id?: unknown }) => !taken.has(String(user._id))
+    );
 
     const needed = [...new Set([...followBackIds, ...friendIds])];
     const knownUsers =
@@ -532,13 +539,16 @@ router.get('/requests', authenticateToken, async (req: Request, res: Response) =
       .populate('requester', 'name email avatar')
       .sort({ createdAt: -1 });
 
-    const formatted = requests.map(r => ({
-      id: r._id.toString(),
-      userId: (r.requester as any)?._id?.toString?.() || String((r.requester as any)?._id || ''),
-      name: (r.requester as any).name || (r.requester as any).email,
-      avatar: publicListAvatar((r.requester as any).avatar, (r.requester as any)?._id?.toString?.() || String((r.requester as any)?._id || '')),
-      status: r.status,
-    }));
+    const hidden = await blockedIdsFor(String(recipientOid));
+    const formatted = requests
+      .map(r => ({
+        id: r._id.toString(),
+        userId: (r.requester as any)?._id?.toString?.() || String((r.requester as any)?._id || ''),
+        name: (r.requester as any).name || (r.requester as any).email,
+        avatar: publicListAvatar((r.requester as any).avatar, (r.requester as any)?._id?.toString?.() || String((r.requester as any)?._id || '')),
+        status: r.status,
+      }))
+      .filter(r => r.userId && !hidden.has(r.userId));
 
     res.json(formatted);
   } catch (error: any) {
@@ -565,6 +575,14 @@ router.post(
 
       if (requesterId === recipientId) {
         return res.status(400).json({ error: 'No puedes enviarte una solicitud a ti mismo' });
+      }
+
+      const blockedAsk = await blockBetween(String(requesterId), String(recipientId));
+      if (blockedAsk === 'you') {
+        return res.status(403).json({ error: 'Has bloqueado a esta persona', blocked: 'you' });
+      }
+      if (blockedAsk === 'them') {
+        return res.status(403).json({ error: 'Te ha bloqueado', blocked: 'them' });
       }
 
       // Verificar que el usuario existe
@@ -652,6 +670,14 @@ router.put('/requests/:id/accept', authenticateToken, async (req: Request, res: 
 
     if (!friendship) {
       return res.status(404).json({ error: 'Solicitud no encontrada' });
+    }
+
+    const blockedAccept = await blockBetween(String(userId), String(friendship.requester));
+    if (blockedAccept === 'you') {
+      return res.status(403).json({ error: 'Has bloqueado a esta persona', blocked: 'you' });
+    }
+    if (blockedAccept === 'them') {
+      return res.status(403).json({ error: 'Te ha bloqueado', blocked: 'them' });
     }
 
     friendship.status = 'accepted';
@@ -879,6 +905,74 @@ router.get('/friends/routine-progress', authenticateToken, async (req: Request, 
  * Perfil de cualquier usuario para la pantalla estilo Instagram. Sin ser amigos se ve la
  * portada (nombre, bio, contadores) pero no las marcas: eso queda para el círculo cercano.
  */
+function gymSessionAt(timestamp: Date, timeHHMM: string): Date {
+  const parts = String(timeHHMM || '').split(':').map(p => parseInt(p, 10));
+  const h = Number.isFinite(parts[0]) ? parts[0] : 0;
+  const m = Number.isFinite(parts[1]) ? parts[1] : 0;
+  const d = new Date(timestamp);
+  d.setHours(h, m, 0, 0);
+  return d;
+}
+
+/** Solo si le sigo: torneo activo o gym en la próxima hora (o acaba de entrar). */
+async function liveProfilePeek(viewerId: string, targetId: string) {
+  const empty = { liveChallenge: null as { title: string; exercise: string } | null, liveGym: null as { gymName: string; time: string } | null };
+  if (!viewerId || !targetId || viewerId === targetId) return empty;
+  if (!(await follows(viewerId, targetId))) return empty;
+
+  const now = new Date();
+  const hourMs = 60 * 60 * 1000;
+  const targetOid = new mongoose.Types.ObjectId(targetId);
+
+  const [challenges, checkins, targetPrivacy] = await Promise.all([
+    Challenge.find({
+      'participants.userId': targetOid,
+      endDate: { $gt: now },
+    })
+      .select('title exercise exercises closeFriendsOnly isPrivate createdBy participants.userId')
+      .sort({ createdAt: -1 })
+      .limit(8)
+      .lean(),
+    GymCheckIn.find({
+      userId: targetOid,
+      expiresAt: { $gt: now },
+    })
+      .sort({ timestamp: -1 })
+      .limit(5)
+      .lean(),
+    loadPrivacy(targetId),
+  ]);
+
+  let liveChallenge: { title: string; exercise: string } | null = null;
+  for (const ch of challenges) {
+    if (ch.closeFriendsOnly) {
+      const { close } = await loadPrivacy(String(ch.createdBy));
+      if (!close.has(viewerId) && String(ch.createdBy) !== viewerId) continue;
+    }
+    if (ch.isPrivate) {
+      const inIt = (ch.participants || []).some(p => String(p.userId) === viewerId);
+      if (!inIt && String(ch.createdBy) !== viewerId) continue;
+    }
+    liveChallenge = {
+      title: ch.title,
+      exercise: Array.isArray(ch.exercises) && ch.exercises.length ? ch.exercises.join(' · ') : ch.exercise,
+    };
+    break;
+  }
+
+  let liveGym: { gymName: string; time: string } | null = null;
+  for (const ci of checkins) {
+    if (!canSeeCloseAudience(viewerId, targetId, ci.audience, targetPrivacy.close)) continue;
+    const delta = gymSessionAt(ci.timestamp, ci.time).getTime() - now.getTime();
+    if (delta <= hourMs && delta >= -hourMs) {
+      liveGym = { gymName: ci.gymName, time: ci.time };
+      break;
+    }
+  }
+
+  return { liveChallenge, liveGym };
+}
+
 router.get('/users/:userId/profile', authenticateToken, async (req: Request, res: Response) => {
   try {
     const viewerId = (req as any).user.userId;
@@ -903,11 +997,12 @@ router.get('/users/:userId/profile', authenticateToken, async (req: Request, res
     const isFriend = isSelf || rel.status === 'accepted' || rel.status === 'following';
     const { close } = isSelf ? { close: new Set<string>() } : await loadPrivacy(String(viewerId));
 
-    const [postCount, sets, athleteCount, coach] = await Promise.all([
+    const [postCount, sets, athleteCount, coach, live] = await Promise.all([
       Post.countDocuments({ userId: targetId, kind: 'post' }),
       connectionSets(String(targetId)),
       User.countDocuments({ coachId: targetId }),
       target.coachId ? User.findById(target.coachId).select('name avatar').lean() : null,
+      isSelf ? Promise.resolve({ liveChallenge: null, liveGym: null }) : liveProfilePeek(String(viewerId), String(targetId)),
     ]);
     const friendCount = sets.mutual.size;
 
@@ -955,6 +1050,8 @@ router.get('/users/:userId/profile', authenticateToken, async (req: Request, res
         value: t.value,
         mode: t.mode,
       })),
+      liveChallenge: live.liveChallenge,
+      liveGym: live.liveGym,
     });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
@@ -1188,7 +1285,7 @@ router.get('/coach-requests', authenticateToken, async (req: Request, res: Respo
       person: {
         id: String(r.athlete?._id ?? r.athlete),
         name: r.athlete?.name || 'Usuario',
-        avatar: r.athlete?.avatar || null,
+        avatar: publicListAvatar(r.athlete?.avatar, String(r.athlete?._id ?? r.athlete)) || null,
       },
     }));
     const fromCoach = invitedMe.map((r: any) => ({
@@ -1198,7 +1295,7 @@ router.get('/coach-requests', authenticateToken, async (req: Request, res: Respo
       person: {
         id: String(r.coach?._id ?? r.coach),
         name: r.coach?.name || 'Usuario',
-        avatar: r.coach?.avatar || null,
+        avatar: publicListAvatar(r.coach?.avatar, String(r.coach?._id ?? r.coach)) || null,
       },
     }));
 
@@ -1363,6 +1460,8 @@ function serializeChatLine(
     mediaKey?: string | null;
     mediaType?: string | null;
     mediaExpiresAt?: Date | string | null;
+    readAt?: Date | string | null;
+    readBy?: unknown[];
     createdAt: Date;
     storyReply?: StoryReplySnap;
   },
@@ -1400,6 +1499,13 @@ function serializeChatLine(
     createdAt: row.createdAt.toISOString(),
     mine: String(row.from) === me,
     author,
+    readAt: String(row.from) === me
+      ? row.readAt
+        ? new Date(row.readAt).toISOString()
+        : (row.readBy || []).some(id => String(id) !== me)
+          ? new Date().toISOString()
+          : null
+      : null,
   };
 }
 
@@ -1417,6 +1523,7 @@ async function readChatAttachment(req: Request): Promise<{ mediaKey: string; med
 
 async function canTalk(me: string, other: string): Promise<boolean> {
   if (me === other || !mongoose.isValidObjectId(other)) return false;
+  if ((await blockBetween(me, other)) !== 'none') return false;
   if (await chatIsOpen(me, other)) return true;
   if (await follows(other, me)) return true;
   return !!(await ChatRequest.exists({
@@ -2058,10 +2165,17 @@ router.get('/chats/groups/:groupId/messages', authenticateToken, async (req: Req
     const authors = await User.find({ _id: { $in: rows.map(r => r.from) } }).select('name avatar').lean();
     const byId = new Map(authors.map(u => [String(u._id), u]));
 
-    await ChatMessage.updateMany(
+    const marked = await ChatMessage.updateMany(
       { groupId, from: { $ne: me }, readBy: { $ne: me } },
       { $addToSet: { readBy: me } }
     );
+    if (marked.modifiedCount > 0) {
+      broadcastSse(
+        group.members.map(id => String(id)).filter(id => id !== me),
+        'chat_read',
+        { groupId, at: new Date().toISOString() }
+      );
+    }
 
     const liveStories = await liveStoryLookup(rows);
     res.json({
@@ -2118,11 +2232,13 @@ router.post('/chats/groups/:groupId/messages', authenticateToken, optionalChatFi
 router.get('/chats/chat-requests', authenticateToken, async (req: Request, res: Response) => {
   try {
     const me = String((req as any).user.userId);
+    const hidden = await blockedIdsFor(me);
     const rows = await ChatRequest.find({ to: me, status: 'pending' }).sort({ createdAt: -1 }).lean();
     const froms = await User.find({ _id: { $in: rows.map(r => r.from) } }).select('name avatar').lean();
     const byId = new Map(froms.map(u => [String(u._id), u]));
     res.json({
       requests: rows
+        .filter(row => !hidden.has(String(row.from)))
         .map(row => {
           const from = byId.get(String(row.from));
           if (!from) return null;
@@ -2145,6 +2261,13 @@ router.put('/chats/chat-requests/:id/accept', authenticateToken, async (req: Req
     const me = String((req as any).user.userId);
     const request = await ChatRequest.findOne({ _id: req.params.id, to: me, status: 'pending' });
     if (!request) return res.status(404).json({ error: 'Solicitud no encontrada' });
+    const blockedChatAsk = await blockBetween(me, String(request.from));
+    if (blockedChatAsk === 'you') {
+      return res.status(403).json({ error: 'Has bloqueado a esta persona', blocked: 'you' });
+    }
+    if (blockedChatAsk === 'them') {
+      return res.status(403).json({ error: 'Te ha bloqueado', blocked: 'them' });
+    }
     request.status = 'accepted';
     await request.save();
     const already = await ChatMessage.exists({
@@ -2184,10 +2307,13 @@ router.post('/chats/:peerId/read', authenticateToken, async (req: Request, res: 
     if (!mongoose.isValidObjectId(peerId) || peerId === me) {
       return res.status(400).json({ error: 'Chat inválido' });
     }
-    await ChatMessage.updateMany(
+    const marked = await ChatMessage.updateMany(
       { groupId: null, from: peerId, to: me, readAt: null },
       { $set: { readAt: new Date() } }
     );
+    if (marked.modifiedCount > 0) {
+      broadcastSse([peerId], 'chat_read', { peerId: me, at: new Date().toISOString() });
+    }
     res.json({ ok: true });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
@@ -2201,10 +2327,17 @@ router.post('/chats/groups/:groupId/read', authenticateToken, async (req: Reques
     if (!mongoose.isValidObjectId(groupId)) return res.status(400).json({ error: 'Grupo inválido' });
     const group = await ChatGroup.findById(groupId).lean();
     if (!group || !isGroupMember(group, me)) return res.status(404).json({ error: 'Grupo no encontrado' });
-    await ChatMessage.updateMany(
+    const marked = await ChatMessage.updateMany(
       { groupId, from: { $ne: me }, readBy: { $ne: me } },
       { $addToSet: { readBy: me } }
     );
+    if (marked.modifiedCount > 0) {
+      broadcastSse(
+        group.members.map(id => String(id)).filter(id => id !== me),
+        'chat_read',
+        { groupId, at: new Date().toISOString() }
+      );
+    }
     res.json({ ok: true });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
@@ -2271,10 +2404,13 @@ router.get('/chats/:peerId/messages', authenticateToken, async (req: Request, re
     const messages = await loadDmLines(me, peerId);
     const online = isUserOnline(peerId);
 
-    await ChatMessage.updateMany(
+    const marked = await ChatMessage.updateMany(
       { groupId: null, from: peerId, to: me, readAt: null },
       { $set: { readAt: new Date() } }
     );
+    if (marked.modifiedCount > 0) {
+      broadcastSse([peerId], 'chat_read', { peerId: me, at: new Date().toISOString() });
+    }
 
     if (outgoing) {
       return res.json({

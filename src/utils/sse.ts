@@ -59,7 +59,8 @@ export type SseEventType =
   | 'challenge_update' // tournaments changed
   | 'routine_update'   // TMs, routine data changed
   | 'chat_message'
-  | 'chat_typing';
+  | 'chat_typing'
+  | 'chat_read';
 
 export function isUserOnline(userId: string): boolean {
   return (clients.get(String(userId))?.length ?? 0) > 0;
