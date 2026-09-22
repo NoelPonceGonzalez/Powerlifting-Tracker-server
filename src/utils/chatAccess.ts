@@ -5,8 +5,21 @@ import { ChatRequest } from '../models/ChatRequest';
 import { User } from '../models/User';
 import { areFriends, follows } from './friendship';
 
+export async function haveSharedChat(a: string, b: string): Promise<boolean> {
+  if (!a || !b || a === b || !mongoose.isValidObjectId(b)) return false;
+  const hit = await ChatMessage.exists({
+    groupId: null,
+    $or: [
+      { from: a, to: b },
+      { from: b, to: a },
+    ],
+  });
+  return !!hit;
+}
+
 export async function chatIsOpen(me: string, other: string): Promise<boolean> {
   if (!me || !other || me === other || !mongoose.isValidObjectId(other)) return false;
+  if (await haveSharedChat(me, other)) return true;
   if (await areFriends(me, other)) return true;
   if (await follows(me, other)) return true;
   const [iTrain, theyTrain, accepted] = await Promise.all([

@@ -60,7 +60,8 @@ export type SseEventType =
   | 'routine_update'   // TMs, routine data changed
   | 'chat_message'
   | 'chat_typing'
-  | 'chat_read';
+  | 'chat_read'
+  | 'chat_wipe';
 
 export function isUserOnline(userId: string): boolean {
   return (clients.get(String(userId))?.length ?? 0) > 0;

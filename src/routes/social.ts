@@ -31,7 +31,7 @@ import { areFriends, connectionSets, describeRelation, follows, loadPair, mutual
 import { blockBetween, blockedIdsFor, canSeeCloseAudience, loadPrivacy } from '../utils/privacy';
 import { Challenge } from '../models/Challenge';
 import { GymCheckIn } from '../models/GymCheckIn';
-import { chatIsOpen, ensurePendingChatRequest, wipeDmBothSides } from '../utils/chatAccess';
+import { chatIsOpen, ensurePendingChatRequest, haveSharedChat, wipeDmBothSides } from '../utils/chatAccess';
 import { publicListAvatar } from '../utils/avatarMedia';
 
 const router = express.Router();
@@ -690,6 +690,33 @@ router.put('/requests/:id/accept', authenticateToken, async (req: Request, res: 
     await friendship.save();
 
     const requesterId = friendship.requester;
+    const chatting = await haveSharedChat(String(userId), String(requesterId));
+    if (chatting) {
+      const mine = await Friendship.findOne({ requester: userId, recipient: requesterId });
+      if (mine) {
+        mine.status = 'accepted';
+        mine.followOnly = true;
+        await mine.save();
+      } else {
+        await Friendship.create({
+          requester: userId,
+          recipient: requesterId,
+          status: 'accepted',
+          followOnly: true,
+        });
+      }
+      await ChatRequest.updateMany(
+        {
+          status: 'pending',
+          $or: [
+            { from: userId, to: requesterId },
+            { from: requesterId, to: userId },
+          ],
+        },
+        { $set: { status: 'accepted' } }
+      );
+    }
+
     const iFollow = await Friendship.exists({
       requester: userId,
       recipient: requesterId,
@@ -2412,19 +2439,9 @@ router.delete('/chats/:peerId', authenticateToken, async (req: Request, res: Res
     if (!mongoose.isValidObjectId(peerId) || peerId === me) {
       return res.status(400).json({ error: 'Chat inválido' });
     }
-    const forEveryone = req.body?.forEveryone === true || req.query.forEveryone === '1';
-    if (forEveryone) {
-      await wipeDmBothSides(me, peerId);
-      res.json({ ok: true, forEveryone: true });
-      return;
-    }
-    await hideChatForMe(me, 'dm', peerId);
-    await ChatMessage.updateMany(
-      { groupId: null, from: peerId, to: me, readAt: null },
-      { $set: { readAt: new Date() } }
-    );
-    await ChatRequest.deleteOne({ from: me, to: peerId, status: 'pending' });
-    res.json({ ok: true });
+    await wipeDmBothSides(me, peerId);
+    broadcastSse([me, peerId], 'chat_wipe', { peerId: me, otherId: peerId });
+    res.json({ ok: true, forEveryone: true });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
