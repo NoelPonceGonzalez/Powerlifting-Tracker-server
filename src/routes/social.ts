@@ -545,14 +545,7 @@ router.get('/requests', authenticateToken, async (req: Request, res: Response) =
       .sort({ createdAt: -1 });
 
     const hidden = await blockedIdsFor(String(recipientOid));
-    const formatted: {
-      id: string;
-      userId: string;
-      name: string;
-      avatar: string;
-      status: string;
-      needsFollowBack?: boolean;
-    }[] = requests
+    const formatted = requests
       .map(r => ({
         id: r._id.toString(),
         userId: (r.requester as any)?._id?.toString?.() || String((r.requester as any)?._id || ''),
@@ -561,46 +554,6 @@ router.get('/requests', authenticateToken, async (req: Request, res: Response) =
         status: r.status,
       }))
       .filter(r => r.userId && !hidden.has(r.userId));
-
-    const pendingRequesterIds = new Set(formatted.map(r => r.userId));
-    const { followers, following, pendingOutgoing } = await connectionSets(userId);
-    const followBackIds = [...followers].filter(
-      id =>
-        !following.has(id) &&
-        !pendingOutgoing.has(id) &&
-        !pendingRequesterIds.has(id) &&
-        !hidden.has(id)
-    );
-
-    if (followBackIds.length > 0) {
-      const confirmed = await Friendship.find({
-        requester: { $in: asObjectIds(followBackIds) },
-        recipient: recipientOid,
-        status: 'accepted',
-      })
-        .select('requester')
-        .lean();
-      const confirmedIds = new Set(confirmed.map(r => String(r.requester)));
-      const ids = followBackIds.filter(id => confirmedIds.has(id));
-      if (ids.length > 0) {
-        const users = await User.find({ _id: { $in: asObjectIds(ids) }, ...REGISTERED_USER_MATCH })
-          .select('name email avatar')
-          .lean();
-        const byId = new Map(users.map(u => [String(u._id), u]));
-        for (const oid of ids) {
-          const u = byId.get(oid);
-          if (!u) continue;
-          formatted.push({
-            id: `followback-${oid}`,
-            userId: oid,
-            name: u.name || u.email,
-            avatar: publicListAvatar(u.avatar, oid),
-            status: 'pending',
-            needsFollowBack: true,
-          });
-        }
-      }
-    }
 
     res.json(formatted);
   } catch (error: any) {
