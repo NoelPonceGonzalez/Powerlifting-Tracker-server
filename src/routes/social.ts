@@ -780,11 +780,7 @@ router.delete('/friends/:friendId', authenticateToken, async (req: Request, res:
     }
 
     // Solo dejo de seguirle yo. Si él me sigue, ese follow se queda.
-    const result = await Friendship.deleteOne({ requester: userId, recipient: friendId });
-
-    if (result.deletedCount === 0) {
-      return res.status(404).json({ error: 'No le sigues' });
-    }
+    await Friendship.deleteOne({ requester: userId, recipient: friendId });
 
     const followsMe = await Friendship.exists({
       requester: friendId,
