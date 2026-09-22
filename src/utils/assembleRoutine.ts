@@ -111,6 +111,7 @@ export async function assembleRoutinePlan(routineId: mongoose.Types.ObjectId) {
           id: `${weekPrefix}-d${dayIdx}`,
           _dbId: String(td._id),
           name: td.name,
+          dayIndex: td.dayIndex,
           type: td.dayType,
           exercises: exercises.map((te: any, exIdx: number) => exerciseToClient(te, dayIdx, exIdx, weekPrefix)),
         };

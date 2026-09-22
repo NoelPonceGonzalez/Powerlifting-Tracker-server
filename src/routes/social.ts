@@ -18,7 +18,7 @@ import { ChatGroupInvite } from '../models/ChatGroupInvite';
 import { ChatHide } from '../models/ChatHide';
 import { ChatRequest } from '../models/ChatRequest';
 import { body, validationResult } from 'express-validator';
-import { assembleFullRoutine } from '../utils/assembleRoutine';
+import { assembleFullRoutine, assembleRoutinePlan } from '../utils/assembleRoutine';
 import { broadcastSse, isUserOnline } from '../utils/sse';
 import {
   isSupportedMediaType,
@@ -330,6 +330,15 @@ router.get('/friends/:friendId/routine', authenticateToken, async (req: Request,
     const routine = await Routine.findOne({ userId: friendObjectId, isActive: true }).lean();
     if (!routine || (routine as { hiddenFromSocial?: boolean }).hiddenFromSocial) {
       return res.json(null);
+    }
+
+    if (String(req.query.preview || '') === '1') {
+      const weeks = await activeRoutineTemplate(routine);
+      const outlined = previewWeeks(weeks);
+      return res.json({
+        name: (routine as { name?: string }).name || 'Rutina',
+        weeks: outlined,
+      });
     }
 
     const assembled = (await assembleFullRoutine(routine)) as Record<string, unknown>;
@@ -966,38 +975,146 @@ function isoWeekNumber(d: Date): number {
   return Math.ceil(((date.getTime() - yearStart.getTime()) / 86400000 + 1) / 7);
 }
 
-/** Día de hoy de su rutina activa, para pintarlo igual que en el perfil propio. */
+type PreviewDay = { name?: string; type?: string; dayIndex?: number; exercises?: { name?: string; exerciseName?: string }[] };
+type PreviewWeek = { number?: number; days?: PreviewDay[] };
+
+/** Plantilla del ciclo, sin logs de entrenamiento. */
+async function activeRoutineTemplate(routine: { _id: unknown; baseTemplate?: unknown; weeks?: unknown }) {
+  const plan = await assembleRoutinePlan(new mongoose.Types.ObjectId(String(routine._id)));
+  const fromPlan =
+    Array.isArray(plan.baseTemplate) && plan.baseTemplate.length
+      ? (plan.baseTemplate as PreviewWeek[])
+      : Array.isArray(plan.versions?.[0]?.weeks) && plan.versions[0].weeks.length
+        ? (plan.versions[0].weeks as PreviewWeek[])
+        : [];
+  if (fromPlan.length) return fromPlan;
+  if (Array.isArray(routine.baseTemplate) && routine.baseTemplate.length) return routine.baseTemplate as PreviewWeek[];
+  if (Array.isArray(routine.weeks) && routine.weeks.length) return routine.weeks as PreviewWeek[];
+  return [] as PreviewWeek[];
+}
+
+function exerciseDetail(ex: { sets?: number; reps?: number | string; pct?: number; weight?: number; setScheme?: string; targetRpe?: string; mode?: string }): string {
+  const scheme = ex.setScheme || (ex.sets ? `${ex.sets}×${ex.reps ?? ''}` : '');
+  const load = ex.pct != null ? ` · ${ex.pct}%` : ex.weight != null ? ` · ${String(ex.weight).replace('.', ',')} kg` : '';
+  const unit = ex.mode === 'seconds' && !ex.setScheme ? '"' : '';
+  const rpe = ex.targetRpe ? ` · RPE ${ex.targetRpe}` : '';
+  return `${scheme}${unit}${load}${rpe}`.trim();
+}
+
+function previewWeeks(weeks: PreviewWeek[]) {
+  return weeks
+    .map((week, i) => ({
+      label: `Semana ${week.number || i + 1}`,
+      days: (week.days || [])
+        .map(d => ({
+          name: d.name || 'Día',
+          exercises: (d.exercises || [])
+            .map(e => ({
+              name: e.name || e.exerciseName || '',
+              detail: exerciseDetail(e as { sets?: number; reps?: number | string; pct?: number; weight?: number; setScheme?: string; targetRpe?: string; mode?: string }),
+            }))
+            .filter(e => e.name),
+        }))
+        .filter(d => d.exercises.length > 0),
+    }))
+    .filter(w => w.days.length > 0);
+}
+
+/** Semana civil 1–52 desde el 1 de enero. La misma cuenta que la pantalla de Rutina, no la semana ISO. */
+function civilWeekOfYear(d: Date): number {
+  const start = new Date(d.getFullYear(), 0, 1);
+  const diffDays = Math.floor((d.getTime() - start.getTime()) / 86400000);
+  return Math.max(1, Math.min(52, Math.floor(diffDays / 7) + 1));
+}
+
+function cycleSlotOf(weekNumber: number, cycleLength: number): number {
+  const cl = Math.max(1, cycleLength);
+  return ((Math.max(1, weekNumber) - 1) % cl) + 1;
+}
+
+function dayLifts(day: PreviewDay | undefined): string[] {
+  return (day?.exercises || []).map(ex => ex.name || ex.exerciseName).filter((n): n is string => !!n);
+}
+
+function isTrainingDay(day: PreviewDay | undefined): boolean {
+  if (!day) return false;
+  return day.type === 'workout' || day.type === 'deload' || dayLifts(day).length > 0;
+}
+
+/** Misma colocación que en Rutina cuando se salta un día de esta semana civil. */
+function applyTodaySkips(days: PreviewDay[], skippedDays: number[]): PreviewDay[] {
+  if (!skippedDays.length) return days;
+  const next = days.map(d => ({ ...d, exercises: [...(d.exercises || [])] }));
+  for (const skipIdx of skippedDays) {
+    if (skipIdx < 0 || skipIdx > 6) continue;
+    const queue: PreviewDay[] = [];
+    for (let i = skipIdx; i < next.length; i++) {
+      if (isTrainingDay(next[i])) queue.push({ ...next[i], exercises: [...(next[i].exercises || [])] });
+      next[i] = { ...next[i], type: 'rest', exercises: [] };
+    }
+    let slot = skipIdx + 1;
+    for (const src of queue) {
+      if (slot >= next.length) break;
+      next[slot] = {
+        ...next[slot],
+        type: src.type === 'deload' ? 'deload' : 'workout',
+        exercises: [...(src.exercises || [])],
+      };
+      slot += 1;
+    }
+  }
+  return next;
+}
+
+/** Día de hoy de su rutina activa: la misma semana del ciclo que se ve en Rutina. */
 async function publicTodayPlan(targetId: string) {
   const routine = await Routine.findOne({ userId: targetId, isActive: true }).lean();
   if (!routine || (routine as { hiddenFromSocial?: boolean }).hiddenFromSocial) return null;
-  const assembled = (await assembleFullRoutine(routine)) as {
-    baseTemplate?: { number?: number; days?: { name?: string; type?: string; exercises?: { name?: string }[] }[] }[];
-    weeks?: { number?: number; days?: { name?: string; type?: string; exercises?: { name?: string }[] }[] }[];
-  };
-  const weeks =
-    Array.isArray(assembled.baseTemplate) && assembled.baseTemplate.length
-      ? assembled.baseTemplate
-      : Array.isArray(assembled.weeks)
-        ? assembled.weeks
-        : [];
   const name = (routine as { name?: string }).name || 'Rutina';
-  if (!weeks.length) {
+  const plan = await assembleRoutinePlan(new mongoose.Types.ObjectId(String(routine._id)));
+  const versions = (plan.versions || []) as { effectiveFromWeek?: number; weeks?: PreviewWeek[]; cycleLength?: number }[];
+  const now = new Date();
+  const civil = civilWeekOfYear(now);
+  const applicable = versions.filter(v => (v.effectiveFromWeek ?? 1) <= civil && (v.weeks || []).length > 0);
+  const best = applicable.length
+    ? applicable.reduce((a, b) => ((a.effectiveFromWeek ?? 1) >= (b.effectiveFromWeek ?? 1) ? a : b))
+    : versions[versions.length - 1];
+  const templateWeeks = (best?.weeks && best.weeks.length ? best.weeks : await activeRoutineTemplate(routine)) as PreviewWeek[];
+  if (!templateWeeks.length) {
     return { name, title: 'Hoy', rest: true, lifts: [] as string[], more: 0 };
   }
-  const same = (routine as { sameTemplateAllWeeks?: boolean }).sameTemplateAllWeeks !== false;
-  const cl = Math.max(1, (routine as { cycleLength?: number }).cycleLength || weeks.length || 4);
-  const cwoy = isoWeekNumber(new Date());
-  const meso = ((Math.max(1, cwoy) - 1) % cl) + 1;
-  const week = same
-    ? weeks[0]
-    : weeks.find(w => Number(w.number) === cwoy) || weeks[meso - 1] || weeks[0];
-  const dow = (new Date().getDay() + 6) % 7;
-  const day = week?.days?.[dow];
-  const lifts = (day?.exercises || []).map(ex => ex.name).filter((n): n is string => !!n);
+
+  const same = parseSameTemplateAllWeeks((routine as { sameTemplateAllWeeks?: unknown }).sameTemplateAllWeeks);
+  const cl = Math.max(1, (routine as { cycleLength?: number }).cycleLength || best?.cycleLength || templateWeeks.length || 4);
+  const shifted = Array.isArray((routine as { shiftedAtCalendarWeeks?: number[] }).shiftedAtCalendarWeeks)
+    ? (routine as { shiftedAtCalendarWeeks: number[] }).shiftedAtCalendarWeeks
+    : [];
+  const weekShift = same ? 0 : shifted.filter(w => w < civil).length;
+  const effective = same ? civil : Math.max(1, civil - weekShift);
+  const weekNumber = same ? civil : ((effective - 1) % 52) + 1;
+  const slot = cycleSlotOf(weekNumber, cl);
+  const week = templateWeeks.find(w => Number(w.number) === slot) || templateWeeks[slot - 1] || templateWeeks[0];
+
+  const dow = (now.getDay() + 6) % 7;
+  const byIndex: PreviewDay[] = [];
+  for (const day of week?.days || []) {
+    const idx = Number.isFinite(day.dayIndex) ? Number(day.dayIndex) : byIndex.length;
+    if (idx >= 0 && idx < 7) byIndex[idx] = day;
+  }
+  const ordered = Array.from({ length: 7 }, (_, i) => byIndex[i] || { type: 'rest' as const });
+  const skips = ((routine as { calendarDayShifts?: { year: number; week: number; skippedDays?: number[] }[] }).calendarDayShifts || [])
+    .find(s => s.year === now.getFullYear() && s.week === civil)?.skippedDays || [];
+  const days = applyTodaySkips(ordered, skips);
+  const dayNames = ['lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado', 'domingo'];
+  const day =
+    days[dow] ||
+    days.find(d => d.dayIndex === dow) ||
+    days.find(d => (d.name || '').trim().toLowerCase() === dayNames[dow]);
+  const lifts = dayLifts(day);
   return {
     name,
     title: day?.name || 'Hoy',
-    rest: !day || day.type === 'rest' || lifts.length === 0,
+    rest: !isTrainingDay(day),
     lifts: lifts.slice(0, 3),
     more: Math.max(0, lifts.length - 3),
   };

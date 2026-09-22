@@ -1,8 +1,10 @@
 import express, { Request, Response } from 'express';
+import { createReadStream, existsSync, statSync } from 'fs';
+import { extname, join, resolve, sep } from 'path';
 import mongoose from 'mongoose';
 import jwt from 'jsonwebtoken';
 import { User } from '../models/User';
-import { isAvatarMediaKey, isInlineAvatar } from '../utils/avatarMedia';
+import { extractAvatarMediaKey, isAvatarMediaKey, isInlineAvatar, isOwnAvatarPointer } from '../utils/avatarMedia';
 import { mediaStorage } from '../utils/mediaStorage';
 import { config } from '../config/env';
 
@@ -24,6 +26,25 @@ const router = express.Router();
 
 const DATA_RE = /^data:(image\/(?:jpeg|jpg|png|webp|gif));base64,([a-z0-9+/=\s]+)$/i;
 
+const LOCAL_MIME: Record<string, string> = {
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.png': 'image/png',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif',
+};
+
+/** Fotos subidas antes de S3 siguen en el disco del servidor. */
+function readLocalAvatar(key: string): { stream: ReturnType<typeof createReadStream>; mimeType: string; size: number } | null {
+  const root = resolve(process.env.MEDIA_LOCAL_DIR || join(process.cwd(), 'uploads'));
+  const rootWithSep = root.endsWith(sep) ? root : root + sep;
+  const full = resolve(join(root, key));
+  if (!full.startsWith(rootWithSep) || !existsSync(full)) return null;
+  const size = statSync(full).size;
+  const mimeType = LOCAL_MIME[extname(full).toLowerCase()] || 'image/jpeg';
+  return { stream: createReadStream(full), mimeType, size };
+}
+
 /** Foto de perfil por id: <img> no puede mandar JWT. */
 router.get('/user/:userId', async (req: Request, res: Response) => {
   try {
@@ -43,18 +64,28 @@ router.get('/user/:userId', async (req: Request, res: Response) => {
       return res.send(buf);
     }
 
-    if (isAvatarMediaKey(raw) || /^\d{6}\/[-\w.]+\.[a-z0-9]+$/i.test(raw)) {
+    const key =
+      extractAvatarMediaKey(raw) ||
+      (isAvatarMediaKey(raw) || /^\d{6}\/[-\w.]+\.[a-z0-9]+$/i.test(raw) ? raw : '');
+    if (key) {
       const storage = mediaStorage();
-      const direct = await storage.publicUrl(raw);
+      // Se sirve desde la API: un redirect a otro host deja la foto en la letra inicial.
+      const found = (await storage.read(key)) || readLocalAvatar(key);
+      if (found) {
+        res.setHeader('Content-Type', found.mimeType);
+        res.setHeader('Content-Length', String(found.size));
+        res.setHeader('Cache-Control', 'private, max-age=86400');
+        res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+        return found.stream.pipe(res);
+      }
+      const direct = await storage.publicUrl(key);
       if (direct) return res.redirect(302, direct);
-      const found = await storage.read(raw);
-      if (!found) return res.status(404).end();
-      res.setHeader('Content-Type', found.mimeType);
-      res.setHeader('Cache-Control', 'private, max-age=86400');
-      return found.stream.pipe(res);
+      res.setHeader('Cache-Control', 'no-store');
+      return res.status(404).end();
     }
 
-    if (/^https?:\/\//i.test(raw)) return res.redirect(raw);
+    // Nunca redirigir a localhost ni a /api/media/user/:id (bucle → letra inicial).
+    if (/^https?:\/\//i.test(raw) && !isOwnAvatarPointer(raw)) return res.redirect(raw);
     return res.status(404).end();
   } catch (error: any) {
     res.status(500).json({ error: error.message });
@@ -75,6 +106,17 @@ router.get('/:folder/:file', async (req: Request, res: Response) => {
     const storage = mediaStorage();
     const direct = await storage.publicUrl(key);
     if (direct) return res.redirect(302, direct);
+    const etag = `"${key}"`;
+    res.setHeader('ETag', etag);
+    res.setHeader('Cache-Control', 'private, max-age=31536000, immutable');
+    const inm = req.headers['if-none-match'];
+    if (inm) {
+      const tags = String(inm).split(',').map(part => part.trim());
+      if (tags.includes('*') || tags.includes(etag)) {
+        res.status(304).end();
+        return;
+      }
+    }
     const rangeHeader = req.headers.range;
 
     if (rangeHeader) {
@@ -94,7 +136,6 @@ router.get('/:folder/:file', async (req: Request, res: Response) => {
       res.setHeader('Accept-Ranges', 'bytes');
       res.setHeader('Content-Length', String(chunk.size));
       res.setHeader('Content-Type', chunk.mimeType);
-      res.setHeader('Cache-Control', 'private, max-age=31536000, immutable');
       return chunk.stream.pipe(res);
     }
 
@@ -103,7 +144,6 @@ router.get('/:folder/:file', async (req: Request, res: Response) => {
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('Content-Length', String(found.size));
     res.setHeader('Content-Type', found.mimeType);
-    res.setHeader('Cache-Control', 'private, max-age=31536000, immutable');
     return found.stream.pipe(res);
   } catch (error: any) {
     res.status(500).json({ error: error.message });

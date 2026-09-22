@@ -60,6 +60,40 @@ export function isSupportedMediaType(mimeType: string): boolean {
   return Object.prototype.hasOwnProperty.call(EXTENSION_BY_MIME, mimeType);
 }
 
+/** Lo mismo con otro nombre: MediaRecorder, iPhone y Android no usan el tipo canónico. */
+const MIME_ALIASES: Record<string, string> = {
+  'image/jpg': 'image/jpeg',
+  'image/pjpeg': 'image/jpeg',
+  'image/x-png': 'image/png',
+  'video/mov': 'video/quicktime',
+  'video/x-quicktime': 'video/quicktime',
+  'video/m4v': 'video/mp4',
+  'video/x-m4v': 'video/mp4',
+  'video/mpeg4': 'video/mp4',
+};
+
+const EXTRA_EXTENSIONS: Record<string, string> = {
+  '.jpeg': 'image/jpeg',
+  '.jpg': 'image/jpeg',
+  '.m4v': 'video/mp4',
+};
+
+/**
+ * `MediaRecorder` devuelve cosas como `video/webm;codecs=vp9` y el móvil a veces manda
+ * `application/octet-stream`. Se queda el tipo base, se traduce el alias y, si aún no
+ * encaja, se mira la extensión del nombre del archivo.
+ */
+export function normalizeMediaMime(mimeType?: string | null, filename?: string | null): string {
+  const base = String(mimeType || '')
+    .split(';')[0]
+    .trim()
+    .toLowerCase();
+  const aliased = MIME_ALIASES[base] || base;
+  if (isSupportedMediaType(aliased)) return aliased;
+  const ext = extname(String(filename || '')).toLowerCase();
+  return MIME_BY_EXTENSION[ext] || EXTRA_EXTENSIONS[ext] || aliased;
+}
+
 export function mediaKindFromMime(mimeType: string): 'image' | 'video' {
   return mimeType.startsWith('video/') ? 'video' : 'image';
 }
@@ -181,6 +215,9 @@ class S3Driver implements MediaDriver {
         Key: `${this.prefix}${key}`,
         Body: buffer,
         ContentType: mimeType,
+        // El archivo no se vuelve a escribir. AWS usa este Cache-Control para no
+        // volver a pedir el objeto mientras siga vigente (docs: Expiration / cache hit ratio).
+        CacheControl: 'private, max-age=31536000, immutable',
       })
     );
     return { key, mimeType, size: buffer.length };

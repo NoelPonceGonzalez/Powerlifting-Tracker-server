@@ -23,26 +23,18 @@ export async function loadPair(a: string, b: string) {
   return { mine, theirs };
 }
 
-function legacyMutual(doc: FriendDoc | null | undefined, other: FriendDoc | null | undefined) {
-  return !!doc && doc.status === 'accepted' && !doc.followOnly && !other;
-}
-
-/** `follower` tiene un follow aceptado hacia `target`. */
+/** `follower` tiene un follow aceptado hacia `target`. Un documento, una dirección. */
 export async function follows(follower: string, target: string): Promise<boolean> {
   if (String(follower) === String(target)) return false;
-  const { mine, theirs } = await loadPair(String(follower), String(target));
-  if (mine?.status === 'accepted') return true;
-  if (legacyMutual(mine, theirs) || legacyMutual(theirs, mine)) return true;
-  return false;
+  const { mine } = await loadPair(String(follower), String(target));
+  return mine?.status === 'accepted';
 }
 
-/** Amigos de verdad: os habéis aceptado los dos, o es una amistad antigua (un solo documento). */
+/** Amigos: las dos direcciones están aceptadas. Que él me siga no hace que yo le siga. */
 export async function areFriends(a: string, b: string): Promise<boolean> {
   if (String(a) === String(b)) return true;
   const { mine, theirs } = await loadPair(String(a), String(b));
-  if (mine?.status === 'accepted' && theirs?.status === 'accepted') return true;
-  if (legacyMutual(mine, theirs) || legacyMutual(theirs, mine)) return true;
-  return false;
+  return mine?.status === 'accepted' && theirs?.status === 'accepted';
 }
 
 export function describeRelation(
@@ -52,9 +44,6 @@ export function describeRelation(
   const mineOk = mine?.status === 'accepted';
   const theirsOk = theirs?.status === 'accepted';
   if (mineOk && theirsOk) return { status: 'accepted', direction: null, canSend: false };
-  if (legacyMutual(mine, theirs) || legacyMutual(theirs, mine)) {
-    return { status: 'accepted', direction: null, canSend: false };
-  }
   if (mine?.status === 'pending') return { status: 'pending', direction: 'outgoing', canSend: false };
   if (theirs?.status === 'pending') return { status: 'pending', direction: 'incoming', canSend: false };
   if (theirsOk && !mineOk) return { status: 'follower', direction: 'incoming', canSend: true };
@@ -83,7 +72,6 @@ export async function mutualFriendIds(userId: string): Promise<string[]> {
 
   const incoming = new Set<string>();
   const outgoing = new Set<string>();
-  const legacy = new Set<string>();
 
   for (const f of rows) {
     const reqId = idOf(f.requester);
@@ -92,15 +80,11 @@ export async function mutualFriendIds(userId: string): Promise<string[]> {
     if (!other || other === me) continue;
     if (reqId === me) outgoing.add(other);
     else incoming.add(other);
-    if (!f.followOnly) legacy.add(other);
   }
 
   const friends = new Set<string>();
   for (const other of outgoing) {
-    if (incoming.has(other) || legacy.has(other)) friends.add(other);
-  }
-  for (const other of incoming) {
-    if (outgoing.has(other) || legacy.has(other)) friends.add(other);
+    if (incoming.has(other)) friends.add(other);
   }
   return Array.from(friends);
 }
@@ -137,7 +121,6 @@ export async function connectionSets(userId: string): Promise<{
   const following = new Set<string>();
   const followers = new Set<string>();
   const pendingOutgoing = new Set<string>();
-  const legacy = new Set<string>();
 
   for (const f of rows) {
     const reqId = idOf(f.requester);
@@ -151,12 +134,6 @@ export async function connectionSets(userId: string): Promise<{
     if (f.status !== 'accepted') continue;
     if (reqId === me) following.add(other);
     else followers.add(other);
-    if (!f.followOnly) legacy.add(other);
-  }
-
-  for (const id of legacy) {
-    following.add(id);
-    followers.add(id);
   }
 
   const mutual = new Set<string>();

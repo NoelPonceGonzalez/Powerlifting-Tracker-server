@@ -8,7 +8,12 @@ import { PostComment } from '../models/PostComment';
 import { Notification } from '../models/Notification';
 import { User } from '../models/User';
 import { ChatMessage } from '../models/ChatMessage';
-import { isSupportedMediaType, mediaKindFromMime, mediaStorage } from '../utils/mediaStorage';
+import {
+  isSupportedMediaType,
+  mediaKindFromMime,
+  mediaStorage,
+  normalizeMediaMime,
+} from '../utils/mediaStorage';
 import { canSeeContent, circleIds } from '../utils/friendship';
 import { blockBetween, blockedIdsFor, canSeeCloseAudience } from '../utils/privacy';
 import { broadcastSse } from '../utils/sse';
@@ -76,21 +81,24 @@ router.post(
   async (req: Request, res: Response) => {
     try {
       const userId = (req as any).user.userId;
-      const file = (req as any).file as { buffer: Buffer; mimetype: string } | undefined;
+      const file = (req as any).file as
+        | { buffer: Buffer; mimetype: string; originalname?: string }
+        | undefined;
       if (!file) return res.status(400).json({ error: 'Falta el archivo' });
-      if (!isSupportedMediaType(file.mimetype)) {
+      const mime = normalizeMediaMime(file.mimetype, file.originalname);
+      if (!isSupportedMediaType(mime)) {
         return res.status(415).json({ error: 'Formato no admitido: usa JPG, PNG, WEBP, GIF, MP4, MOV o WEBM' });
       }
 
       const kind = String(req.body.kind || 'story') === 'post' ? 'post' : 'story';
       const caption = String(req.body.caption || '').trim().slice(0, 2200);
       const audience = String(req.body.audience || 'all') === 'close' ? 'close' : 'all';
-      const stored = await mediaStorage().save(file.buffer, file.mimetype);
+      const stored = await mediaStorage().save(file.buffer, mime);
 
       const post = await Post.create({
         userId: toObjectId(userId),
         kind,
-        mediaType: mediaKindFromMime(file.mimetype),
+        mediaType: mediaKindFromMime(mime),
         mediaKey: stored.key,
         mimeType: stored.mimeType,
         caption,

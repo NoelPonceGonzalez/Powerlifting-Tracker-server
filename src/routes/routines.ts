@@ -16,7 +16,12 @@ import { WorkoutExercise } from '../models/WorkoutExercise';
 import { WorkoutSet } from '../models/WorkoutSet';
 import { body, validationResult } from 'express-validator';
 import { broadcastSse } from '../utils/sse';
-import { isSupportedMediaType, mediaKindFromMime, mediaStorage } from '../utils/mediaStorage';
+import {
+  isSupportedMediaType,
+  mediaKindFromMime,
+  mediaStorage,
+  normalizeMediaMime,
+} from '../utils/mediaStorage';
 import {
   assembleFullRoutine,
   assembleRoutinePlan,
@@ -478,14 +483,15 @@ router.post(
       const userId = (req as any).user.userId;
       const file = (req as Request & { file?: Express.Multer.File }).file;
       if (!file) return res.status(400).json({ error: 'Adjunta un vídeo o una foto' });
-      if (!isSupportedMediaType(file.mimetype)) {
+      const mime = normalizeMediaMime(file.mimetype, file.originalname);
+      if (!isSupportedMediaType(mime)) {
         return res.status(400).json({ error: 'Solo fotos (JPG, PNG, WEBP, GIF) o vídeos (MP4, MOV, WEBM)' });
       }
       const routine = await Routine.findOne({ _id: req.params.id, userId });
       if (!routine) return res.status(404).json({ error: 'Rutina no encontrada' });
 
-      const stored = await mediaStorage().save(file.buffer, file.mimetype);
-      const mediaType = mediaKindFromMime(file.mimetype);
+      const stored = await mediaStorage().save(file.buffer, mime);
+      const mediaType = mediaKindFromMime(mime);
       res.status(201).json({ mediaKey: stored.key, mediaType });
     } catch (error: any) {
       res.status(500).json({ error: error.message });

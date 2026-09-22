@@ -1,6 +1,6 @@
 import { User } from '../models/User';
 import { logger } from './logger';
-import { isSupportedMediaType, mediaStorage } from './mediaStorage';
+import { isSupportedMediaType, mediaStorage, normalizeMediaMime } from './mediaStorage';
 
 const DATA_RE = /^data:(image\/(?:jpeg|jpg|png|webp|gif));base64,([a-z0-9+/=\s]+)$/i;
 const KEY_RE =
@@ -24,6 +24,45 @@ export function publicAvatarRef(value?: string | null): string {
   return raw;
 }
 
+const USER_MEDIA_RE = /\/api\/media\/user\/([a-f0-9]{24})/i;
+const MEDIA_KEY_IN_URL_RE =
+  /(\d{6}\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.[a-z0-9]+)/i;
+
+function isLocalHostName(host: string): boolean {
+  const h = host.toLowerCase();
+  return h === 'localhost' || h === '127.0.0.1' || h === '0.0.0.0' || h === '10.0.2.2';
+}
+
+/** URL propia o localhost: no sirve como foto, es un puntero al endpoint. */
+export function isOwnAvatarPointer(value?: string | null): boolean {
+  const raw = (value || '').trim();
+  if (!raw) return false;
+  if (USER_MEDIA_RE.test(raw)) return true;
+  try {
+    const u = raw.startsWith('http://') || raw.startsWith('https://') ? new URL(raw) : null;
+    if (!u) return false;
+    if (isLocalHostName(u.hostname)) return true;
+    return u.pathname.startsWith('/api/media/');
+  } catch {
+    return false;
+  }
+}
+
+export function extractAvatarMediaKey(value?: string | null): string {
+  const raw = (value || '').trim();
+  if (isAvatarMediaKey(raw) || /^\d{6}\/[-\w.]+\.[a-z0-9]+$/i.test(raw)) return raw;
+  const fromUrl = MEDIA_KEY_IN_URL_RE.exec(raw);
+  if (fromUrl?.[1]) return fromUrl[1];
+  try {
+    const path = raw.startsWith('http') ? new URL(raw).pathname : raw;
+    const m = /\/api\/media\/(\d{6}\/[^/?#]+)/i.exec(path);
+    if (m?.[1] && !m[1].startsWith('user/')) return m[1];
+  } catch {
+    /* ignore */
+  }
+  return '';
+}
+
 /**
  * URL que el cliente puede poner en <img>. Si hay foto real (clave o data:),
  * se sirve por /api/media/user/:id para que se vea en perfil, social y chats.
@@ -31,18 +70,21 @@ export function publicAvatarRef(value?: string | null): string {
 export function publicListAvatar(value?: string | null, userId?: string): string {
   const raw = (value || '').trim();
   if (!raw || FAKE_AVATAR.test(raw)) return '';
-  if (raw.startsWith('http://') || raw.startsWith('https://')) return raw;
   const id = String(userId || '').trim();
+  if ((raw.startsWith('http://') || raw.startsWith('https://')) && !isOwnAvatarPointer(raw)) {
+    return raw;
+  }
   if (!id) {
     if (isInlineAvatar(raw)) return '';
     return publicAvatarRef(raw);
   }
-  const version = isAvatarMediaKey(raw) ? raw.slice(-12) : 'live';
+  const key = extractAvatarMediaKey(raw);
+  const version = key ? key.slice(-12) : isAvatarMediaKey(raw) ? raw.slice(-12) : 'live';
   return `/api/media/user/${id}?v=${encodeURIComponent(version)}`;
 }
 
 export async function saveAvatarBuffer(buffer: Buffer, mimeType: string): Promise<string> {
-  const mime = mimeType === 'image/jpg' ? 'image/jpeg' : mimeType;
+  const mime = normalizeMediaMime(mimeType);
   if (!mime.startsWith('image/') || !isSupportedMediaType(mime)) {
     throw new Error('Usa JPG, PNG o WEBP');
   }
@@ -78,6 +120,14 @@ export async function resolveIncomingAvatar(
     const key = await saveAvatarDataUrl(v);
     await dropOldKey(prev);
     return key;
+  }
+  if (isOwnAvatarPointer(v) && !extractAvatarMediaKey(v)) {
+    return prev === undefined ? undefined : String(prev || '');
+  }
+  const extracted = extractAvatarMediaKey(v);
+  if (extracted) {
+    if (extracted !== (prev || '').trim()) await dropOldKey(prev);
+    return extracted;
   }
   if (isAvatarMediaKey(v) || v.startsWith('http://') || v.startsWith('https://')) {
     if (v !== (prev || '').trim()) await dropOldKey(prev);
