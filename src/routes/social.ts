@@ -20,7 +20,12 @@ import { ChatRequest } from '../models/ChatRequest';
 import { body, validationResult } from 'express-validator';
 import { assembleFullRoutine } from '../utils/assembleRoutine';
 import { broadcastSse, isUserOnline } from '../utils/sse';
-import { isSupportedMediaType, mediaKindFromMime, mediaStorage } from '../utils/mediaStorage';
+import {
+  isSupportedMediaType,
+  mediaKindFromMime,
+  mediaStorage,
+  normalizeMediaMime,
+} from '../utils/mediaStorage';
 import { chatMediaExpiresAt, isChatMediaLive } from '../utils/chatMedia';
 import { areFriends, connectionSets, describeRelation, follows, loadPair, mutualFriendIds } from '../utils/friendship';
 import { blockBetween, blockedIdsFor, canSeeCloseAudience, loadPrivacy } from '../utils/privacy';
@@ -540,7 +545,14 @@ router.get('/requests', authenticateToken, async (req: Request, res: Response) =
       .sort({ createdAt: -1 });
 
     const hidden = await blockedIdsFor(String(recipientOid));
-    const formatted = requests
+    const formatted: {
+      id: string;
+      userId: string;
+      name: string;
+      avatar: string;
+      status: string;
+      needsFollowBack?: boolean;
+    }[] = requests
       .map(r => ({
         id: r._id.toString(),
         userId: (r.requester as any)?._id?.toString?.() || String((r.requester as any)?._id || ''),
@@ -549,6 +561,46 @@ router.get('/requests', authenticateToken, async (req: Request, res: Response) =
         status: r.status,
       }))
       .filter(r => r.userId && !hidden.has(r.userId));
+
+    const pendingRequesterIds = new Set(formatted.map(r => r.userId));
+    const { followers, following, pendingOutgoing } = await connectionSets(userId);
+    const followBackIds = [...followers].filter(
+      id =>
+        !following.has(id) &&
+        !pendingOutgoing.has(id) &&
+        !pendingRequesterIds.has(id) &&
+        !hidden.has(id)
+    );
+
+    if (followBackIds.length > 0) {
+      const confirmed = await Friendship.find({
+        requester: { $in: asObjectIds(followBackIds) },
+        recipient: recipientOid,
+        status: 'accepted',
+      })
+        .select('requester')
+        .lean();
+      const confirmedIds = new Set(confirmed.map(r => String(r.requester)));
+      const ids = followBackIds.filter(id => confirmedIds.has(id));
+      if (ids.length > 0) {
+        const users = await User.find({ _id: { $in: asObjectIds(ids) }, ...REGISTERED_USER_MATCH })
+          .select('name email avatar')
+          .lean();
+        const byId = new Map(users.map(u => [String(u._id), u]));
+        for (const oid of ids) {
+          const u = byId.get(oid);
+          if (!u) continue;
+          formatted.push({
+            id: `followback-${oid}`,
+            userId: oid,
+            name: u.name || u.email,
+            avatar: publicListAvatar(u.avatar, oid),
+            status: 'pending',
+            needsFollowBack: true,
+          });
+        }
+      }
+    }
 
     res.json(formatted);
   } catch (error: any) {
@@ -599,14 +651,14 @@ router.post(
         return res.status(400).json({ error: 'Ya le enviaste una solicitud; está pendiente de respuesta' });
       }
       if (mine?.status === 'accepted') {
-        return res.status(400).json({ error: 'Ya le enviaste la solicitud' });
+        return res.status(400).json({ error: 'Ya le sigues' });
       }
 
       let friendship;
       const mineDoc = await Friendship.findOne({ requester: requesterId, recipient: recipientId });
       if (mineDoc) {
         mineDoc.status = 'pending';
-        mineDoc.followOnly = false;
+        mineDoc.followOnly = true;
         await mineDoc.save();
         friendship = mineDoc;
       } else {
@@ -614,7 +666,7 @@ router.post(
           requester: requesterId,
           recipient: recipientId,
           status: 'pending',
-          followOnly: false,
+          followOnly: true,
         });
         await friendship.save();
       }
@@ -681,15 +733,15 @@ router.put('/requests/:id/accept', authenticateToken, async (req: Request, res: 
     }
 
     friendship.status = 'accepted';
-    friendship.followOnly = false;
+    friendship.followOnly = true;
     await friendship.save();
 
     const requesterId = friendship.requester;
-    await Friendship.findOneAndUpdate(
-      { requester: userId, recipient: requesterId },
-      { $set: { status: 'accepted', followOnly: false } },
-      { upsert: true }
-    );
+    const iFollow = await Friendship.exists({
+      requester: userId,
+      recipient: requesterId,
+      status: 'accepted',
+    });
 
     const currentUser = await User.findById(userId);
     const requesterUser = await User.findById(requesterId).select('name email avatar');
@@ -699,7 +751,7 @@ router.put('/requests/:id/accept', authenticateToken, async (req: Request, res: 
       userId: requesterId,
       type: 'friend_accepted',
       title: `${acceptorName} ha aceptado tu solicitud`,
-      message: '¡Ahora sois amigos!',
+      message: 'Ahora le sigues',
       relatedUserId: userId,
     });
 
@@ -708,7 +760,7 @@ router.put('/requests/:id/accept', authenticateToken, async (req: Request, res: 
       await sendPushToUser(
         String(requesterId),
         `${acceptorName} ha aceptado tu solicitud`,
-        '¡Ahora sois amigos!',
+        'Ahora le sigues',
         { type: 'friend_accepted', relatedUserId: String(userId) }
       );
     } catch (e) {
@@ -720,7 +772,11 @@ router.put('/requests/:id/accept', authenticateToken, async (req: Request, res: 
     res.json({
       id: friendship._id.toString(),
       status: 'accepted',
-      friends: true,
+      friends: !!iFollow,
+      iFollow: !!iFollow,
+      followsMe: true,
+      canSendRequest: !iFollow,
+      friendshipStatus: iFollow ? 'accepted' : 'follower',
       friend: {
         id: String(requesterId),
         name: requesterName,
@@ -770,21 +826,27 @@ router.delete('/friends/:friendId', authenticateToken, async (req: Request, res:
       return res.status(400).json({ error: 'No puedes eliminarte a ti mismo' });
     }
 
-    // Se borra la relación entera: un documento residual impediría volver a enviar solicitud.
-    const result = await Friendship.deleteMany({
-      $or: [
-        { requester: userId, recipient: friendId },
-        { requester: friendId, recipient: userId },
-      ],
-    });
+    // Solo dejo de seguirle yo. Si él me sigue, ese follow se queda.
+    const result = await Friendship.deleteOne({ requester: userId, recipient: friendId });
 
     if (result.deletedCount === 0) {
-      return res.status(404).json({ error: 'No existe amistad con este usuario' });
+      return res.status(404).json({ error: 'No le sigues' });
     }
+
+    const followsMe = await Friendship.exists({
+      requester: friendId,
+      recipient: userId,
+      status: 'accepted',
+    });
 
     broadcastSse([userId, friendId], 'social_update');
 
-    res.json({ message: 'Amistad eliminada' });
+    res.json({
+      message: 'Has dejado de seguirle',
+      followsMe: !!followsMe,
+      friendshipStatus: followsMe ? 'follower' : 'none',
+      canSendRequest: true,
+    });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
@@ -905,23 +967,72 @@ router.get('/friends/routine-progress', authenticateToken, async (req: Request, 
  * Perfil de cualquier usuario para la pantalla estilo Instagram. Sin ser amigos se ve la
  * portada (nombre, bio, contadores) pero no las marcas: eso queda para el círculo cercano.
  */
-function gymSessionAt(timestamp: Date, timeHHMM: string): Date {
-  const parts = String(timeHHMM || '').split(':').map(p => parseInt(p, 10));
-  const h = Number.isFinite(parts[0]) ? parts[0] : 0;
-  const m = Number.isFinite(parts[1]) ? parts[1] : 0;
-  const d = new Date(timestamp);
-  d.setHours(h, m, 0, 0);
-  return d;
+
+type ProfileChallenge = { title: string; exercise: string };
+type ProfileGymPlan = { gymName: string; time: string };
+type LivePeek = {
+  /** Ellos me siguen: entonces se ven sus torneos y a qué hora van. */
+  theyFollowMe: boolean;
+  challenges: ProfileChallenge[];
+  gymPlans: ProfileGymPlan[];
+};
+
+function emptyLive(): LivePeek {
+  return { theyFollowMe: false, challenges: [], gymPlans: [] };
 }
 
-/** Solo si le sigo: torneo activo o gym en la próxima hora (o acaba de entrar). */
-async function liveProfilePeek(viewerId: string, targetId: string) {
-  const empty = { liveChallenge: null as { title: string; exercise: string } | null, liveGym: null as { gymName: string; time: string } | null };
-  if (!viewerId || !targetId || viewerId === targetId) return empty;
-  if (!(await follows(viewerId, targetId))) return empty;
+/** Semana ISO, lunes = 1. Misma idea que el perfil propio. */
+function isoWeekNumber(d: Date): number {
+  const date = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+  const day = date.getUTCDay() || 7;
+  date.setUTCDate(date.getUTCDate() + 4 - day);
+  const yearStart = new Date(Date.UTC(date.getUTCFullYear(), 0, 1));
+  return Math.ceil(((date.getTime() - yearStart.getTime()) / 86400000 + 1) / 7);
+}
+
+/** Día de hoy de su rutina activa, para pintarlo igual que en el perfil propio. */
+async function publicTodayPlan(targetId: string) {
+  const routine = await Routine.findOne({ userId: targetId, isActive: true }).lean();
+  if (!routine || (routine as { hiddenFromSocial?: boolean }).hiddenFromSocial) return null;
+  const assembled = (await assembleFullRoutine(routine)) as {
+    baseTemplate?: { number?: number; days?: { name?: string; type?: string; exercises?: { name?: string }[] }[] }[];
+    weeks?: { number?: number; days?: { name?: string; type?: string; exercises?: { name?: string }[] }[] }[];
+  };
+  const weeks =
+    Array.isArray(assembled.baseTemplate) && assembled.baseTemplate.length
+      ? assembled.baseTemplate
+      : Array.isArray(assembled.weeks)
+        ? assembled.weeks
+        : [];
+  const name = (routine as { name?: string }).name || 'Rutina';
+  if (!weeks.length) {
+    return { name, title: 'Hoy', rest: true, lifts: [] as string[], more: 0 };
+  }
+  const same = (routine as { sameTemplateAllWeeks?: boolean }).sameTemplateAllWeeks !== false;
+  const cl = Math.max(1, (routine as { cycleLength?: number }).cycleLength || weeks.length || 4);
+  const cwoy = isoWeekNumber(new Date());
+  const meso = ((Math.max(1, cwoy) - 1) % cl) + 1;
+  const week = same
+    ? weeks[0]
+    : weeks.find(w => Number(w.number) === cwoy) || weeks[meso - 1] || weeks[0];
+  const dow = (new Date().getDay() + 6) % 7;
+  const day = week?.days?.[dow];
+  const lifts = (day?.exercises || []).map(ex => ex.name).filter((n): n is string => !!n);
+  return {
+    name,
+    title: day?.name || 'Hoy',
+    rest: !day || day.type === 'rest' || lifts.length === 0,
+    lifts: lifts.slice(0, 3),
+    more: Math.max(0, lifts.length - 3),
+  };
+}
+
+/** Torneos y gym solo si esa persona me sigue. La rutina va aparte. */
+async function liveProfilePeek(viewerId: string, targetId: string): Promise<LivePeek> {
+  if (!viewerId || !targetId || viewerId === targetId) return emptyLive();
+  if (!(await follows(targetId, viewerId))) return emptyLive();
 
   const now = new Date();
-  const hourMs = 60 * 60 * 1000;
   const targetOid = new mongoose.Types.ObjectId(targetId);
 
   const [challenges, checkins, targetPrivacy] = await Promise.all([
@@ -943,7 +1054,7 @@ async function liveProfilePeek(viewerId: string, targetId: string) {
     loadPrivacy(targetId),
   ]);
 
-  let liveChallenge: { title: string; exercise: string } | null = null;
+  const visibleChallenges: ProfileChallenge[] = [];
   for (const ch of challenges) {
     if (ch.closeFriendsOnly) {
       const { close } = await loadPrivacy(String(ch.createdBy));
@@ -953,24 +1064,21 @@ async function liveProfilePeek(viewerId: string, targetId: string) {
       const inIt = (ch.participants || []).some(p => String(p.userId) === viewerId);
       if (!inIt && String(ch.createdBy) !== viewerId) continue;
     }
-    liveChallenge = {
+    visibleChallenges.push({
       title: ch.title,
       exercise: Array.isArray(ch.exercises) && ch.exercises.length ? ch.exercises.join(' · ') : ch.exercise,
-    };
-    break;
+    });
+    if (visibleChallenges.length >= 6) break;
   }
 
-  let liveGym: { gymName: string; time: string } | null = null;
+  const gymPlans: ProfileGymPlan[] = [];
   for (const ci of checkins) {
     if (!canSeeCloseAudience(viewerId, targetId, ci.audience, targetPrivacy.close)) continue;
-    const delta = gymSessionAt(ci.timestamp, ci.time).getTime() - now.getTime();
-    if (delta <= hourMs && delta >= -hourMs) {
-      liveGym = { gymName: ci.gymName, time: ci.time };
-      break;
-    }
+    gymPlans.push({ gymName: ci.gymName, time: ci.time });
+    if (gymPlans.length >= 4) break;
   }
 
-  return { liveChallenge, liveGym };
+  return { theyFollowMe: true, challenges: visibleChallenges, gymPlans };
 }
 
 router.get('/users/:userId/profile', authenticateToken, async (req: Request, res: Response) => {
@@ -997,12 +1105,13 @@ router.get('/users/:userId/profile', authenticateToken, async (req: Request, res
     const isFriend = isSelf || rel.status === 'accepted' || rel.status === 'following';
     const { close } = isSelf ? { close: new Set<string>() } : await loadPrivacy(String(viewerId));
 
-    const [postCount, sets, athleteCount, coach, live] = await Promise.all([
+    const [postCount, sets, athleteCount, coach, live, todayPlan] = await Promise.all([
       Post.countDocuments({ userId: targetId, kind: 'post' }),
       connectionSets(String(targetId)),
       User.countDocuments({ coachId: targetId }),
       target.coachId ? User.findById(target.coachId).select('name avatar').lean() : null,
-      isSelf ? Promise.resolve({ liveChallenge: null, liveGym: null }) : liveProfilePeek(String(viewerId), String(targetId)),
+      isSelf ? Promise.resolve(emptyLive()) : liveProfilePeek(String(viewerId), String(targetId)),
+      isSelf ? Promise.resolve(null) : publicTodayPlan(String(targetId)).catch(() => null),
     ]);
     const friendCount = sets.mutual.size;
 
@@ -1050,8 +1159,10 @@ router.get('/users/:userId/profile', authenticateToken, async (req: Request, res
         value: t.value,
         mode: t.mode,
       })),
-      liveChallenge: live.liveChallenge,
-      liveGym: live.liveGym,
+      theyFollowMe: live.theyFollowMe,
+      challenges: live.challenges,
+      gymPlans: live.gymPlans,
+      todayPlan,
     });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
@@ -1512,13 +1623,14 @@ function serializeChatLine(
 async function readChatAttachment(req: Request): Promise<{ mediaKey: string; mediaType: 'image' | 'video' } | null> {
   const file = (req as Request & { file?: Express.Multer.File }).file;
   if (!file) return null;
-  if (!isSupportedMediaType(file.mimetype)) {
+  const mime = normalizeMediaMime(file.mimetype, file.originalname);
+  if (!isSupportedMediaType(mime)) {
     const err = new Error('Solo fotos (JPG, PNG, WEBP, GIF) o vídeos (MP4, MOV, WEBM)');
     (err as Error & { status?: number }).status = 400;
     throw err;
   }
-  const stored = await mediaStorage().save(file.buffer, file.mimetype);
-  return { mediaKey: stored.key, mediaType: mediaKindFromMime(file.mimetype) };
+  const stored = await mediaStorage().save(file.buffer, mime);
+  return { mediaKey: stored.key, mediaType: mediaKindFromMime(mime) };
 }
 
 async function canTalk(me: string, other: string): Promise<boolean> {
