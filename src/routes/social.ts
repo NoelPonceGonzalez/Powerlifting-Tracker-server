@@ -744,6 +744,18 @@ router.put('/requests/:id/accept', authenticateToken, async (req: Request, res: 
       relatedUserId: userId,
     });
 
+    // Quien acepta sale de solicitudes: el seguir de vuelta queda en Actividad.
+    if (!iFollow) {
+      await Notification.create({
+        userId,
+        type: 'friend_accepted',
+        title: `${requesterName} ahora te sigue`,
+        message: 'Ahora te sigue',
+        relatedUserId: requesterId,
+        relatedData: { kind: 'new_follower' },
+      });
+    }
+
     try {
       const { sendPushToUser } = await import('../utils/push');
       await sendPushToUser(
