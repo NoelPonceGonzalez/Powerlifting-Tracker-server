@@ -123,7 +123,10 @@ router.post(
 
       const userId = (req as any).user.userId;
       const { title, type, exercise, endDate, description } = req.body;
-      const exercises = normalizeChallengeExercises(exercise, req.body.exercises);
+      const meetRequested = req.body.meet === true || req.body.meet === 'true';
+      const exercises = meetRequested
+        ? ['Sentadilla', 'Press banca', 'Peso muerto']
+        : normalizeChallengeExercises(exercise, req.body.exercises);
       if (exercises.length === 0) {
         return res.status(400).json({ error: 'Añade al menos un ejercicio' });
       }
@@ -137,8 +140,10 @@ router.post(
       if (isPrivate && rawPassword.length < 4) {
         return res.status(400).json({ error: 'La contraseña del torneo privado debe tener al menos 4 caracteres' });
       }
-      const usePointsSystem =
-        req.body.usePointsSystem !== false && req.body.usePointsSystem !== 'false';
+      const meet = req.body.meet === true || req.body.meet === 'true';
+      const usePointsSystem = meet
+        ? true
+        : req.body.usePointsSystem !== false && req.body.usePointsSystem !== 'false';
       const bodyWeightScoring = normalizeBodyWeightScoring(req.body.bodyWeightScoring);
 
       const creator = await User.findById(userId);
@@ -149,7 +154,7 @@ router.post(
         createdBy: userId,
         title,
         description: description || '',
-        type,
+        type: meet ? 'weight' : type,
         exercise: exerciseText,
         exercises,
         isPrivate,
@@ -157,6 +162,7 @@ router.post(
         passwordHash: isPrivate ? await bcrypt.hash(rawPassword, 10) : '',
         usePointsSystem,
         bodyWeightScoring,
+        meet,
         endDate: new Date(endDate),
         participants: [{
           userId: userId as any,
@@ -269,6 +275,81 @@ router.put(
         if (!challenge.passwordHash || !(await bcrypt.compare(given, challenge.passwordHash))) {
           return res.status(403).json({ error: 'Contraseña incorrecta' });
         }
+      }
+
+      if (challenge.meet) {
+        const triple = (raw: unknown): [number, number, number] => {
+          const arr = Array.isArray(raw) ? raw : [];
+          return [0, 1, 2].map((i) => {
+            const n = Number(arr[i]);
+            if (!Number.isFinite(n) || n < 0) return 0;
+            return Math.round(n * 10) / 10;
+          }) as [number, number, number];
+        };
+        const attempts = {
+          squat: triple(req.body?.attempts?.squat),
+          bench: triple(req.body?.attempts?.bench),
+          deadlift: triple(req.body?.attempts?.deadlift),
+        };
+        const best = (xs: number[]) => xs.reduce((m, n) => (n > m ? n : m), 0);
+        const squat = best(attempts.squat);
+        const bench = best(attempts.bench);
+        const deadlift = best(attempts.deadlift);
+        if (squat <= 0 && bench <= 0 && deadlift <= 0) {
+          return res.status(400).json({ error: 'Pon al menos un intento válido.' });
+        }
+        const ordered = [
+          { exercise: 'Sentadilla', value: squat },
+          { exercise: 'Press banca', value: bench },
+          { exercise: 'Peso muerto', value: deadlift },
+        ];
+        const value = Math.round((squat + bench + deadlift) * 10) / 10;
+        const { ipfGlEquippedPoints } = await import('../utils/challengeScoring');
+        const score = ipfGlEquippedPoints(value, user?.bodyWeight ?? 0, user?.gender === 'mujer' ? 'mujer' : 'hombre');
+        if (existingParticipant) {
+          existingParticipant.score = score;
+          existingParticipant.value = value;
+          existingParticipant.lifts = ordered;
+          existingParticipant.attempts = attempts;
+        } else {
+          challenge.participants.push({
+            userId: userId as any,
+            name: user?.name || user?.email || 'Usuario',
+            avatar: publicListAvatar(user?.avatar, String(userId)),
+            score,
+            value,
+            lifts: ordered,
+            attempts,
+            initialValue: value,
+            initialScore: score,
+            joinedAt: new Date(),
+          });
+        }
+        const justJoined = !existingParticipant;
+        const firstRealMark = Boolean(existingParticipant && existingParticipant.initialRank == null && value > 0);
+        if (justJoined || firstRealMark) {
+          const rank = rankOfParticipant(challenge.participants, userId, true);
+          const target = challenge.participants.find((p) => participantUserIdString(p) === userId);
+          if (target && rank > 0) target.initialRank = rank;
+        }
+        await challenge.save();
+        if (!isCreator && !existingParticipant) {
+          const joinerName = user?.name || user?.email || 'Alguien';
+          try {
+            await Notification.create({
+              userId: creatorId,
+              type: 'challenge_join',
+              title: `${joinerName} se ha unido a tu torneo`,
+              message: `"${challenge.title}"`,
+              relatedUserId: userId,
+              relatedData: { challengeId: challenge._id.toString() },
+            });
+          } catch (e) {
+            console.error('[PUSH] Error challenge_join meet:', e);
+          }
+        }
+        const fresh = await Challenge.findById(challenge._id).populate('createdBy', 'name email avatar').populate('participants.userId', 'name email avatar bodyWeight gender');
+        return res.json(formatChallengeDoc(fresh || challenge));
       }
 
       const names = normalizeChallengeExercises(challenge.exercise, challenge.exercises);

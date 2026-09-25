@@ -49,7 +49,7 @@ function buildPushDataPayload(data?: Record<string, any>): Record<string, string
   } else if (type === 'friend_request' || type === 'friend_accepted') {
     screen = 'social';
     tab = 'friends';
-  } else if (type === 'challenge_invite' || type === 'challenge_join' || type === 'challenge_winner') {
+  } else if (type === 'challenge_invite' || type === 'challenge_join' || type === 'challenge_winner' || type === 'challenge_ending' || type === 'sbd_update') {
     screen = 'social';
     tab = 'challenges';
   } else if (type === 'gym_checkin' || type === 'same_time_confirmation') {

@@ -143,7 +143,52 @@ async function processOneChallenge(challenge: any): Promise<void> {
  * Torneos con fecha de fin pasada y sin notificación de ganador.
  * Se ejecuta de forma periódica al arrancar el servidor.
  */
+async function processEndingSoon(): Promise<void> {
+  const now = Date.now();
+  const soon = new Date(now + 24 * 60 * 60 * 1000);
+  const pending = await Challenge.find({
+    endDate: { $gt: new Date(now), $lte: soon },
+    $or: [{ endingSoonNotifiedAt: null }, { endingSoonNotifiedAt: { $exists: false } }],
+  }).select('title endDate participants');
+
+  for (const doc of pending) {
+    try {
+      const claimed = await Challenge.findOneAndUpdate(
+        {
+          _id: doc._id,
+          $or: [{ endingSoonNotifiedAt: null }, { endingSoonNotifiedAt: { $exists: false } }],
+        },
+        { $set: { endingSoonNotifiedAt: new Date() } }
+      );
+      if (!claimed) continue;
+      const hours = Math.max(1, Math.round((new Date(claimed.endDate).getTime() - now) / 3600000));
+      const title = `Quedan ${hours} h`;
+      const message = `El torneo "${claimed.title}" acaba en ${hours} h.`;
+      const ids = (claimed.participants || []).map((p) => participantUserIdString(p));
+      if (ids.length === 0) continue;
+      await Notification.insertMany(
+        ids.map((id) => ({
+          userId: new mongoose.Types.ObjectId(id),
+          type: 'challenge_ending',
+          title,
+          message,
+          relatedData: { challengeId: claimed._id.toString(), hours },
+          read: false,
+        }))
+      );
+      await sendPushToUsers(ids, title, message, {
+        type: 'challenge_ending',
+        challengeId: claimed._id.toString(),
+      });
+      broadcastSse(ids, 'challenge_update');
+    } catch (e) {
+      logger.error(`[challenge_ending] ${doc._id?.toString()}`, e);
+    }
+  }
+}
+
 export async function processFinishedChallengeWinnerNotifications(): Promise<void> {
+  await processEndingSoon();
   const now = new Date();
   const pending = await Challenge.find({
     endDate: { $lte: now },

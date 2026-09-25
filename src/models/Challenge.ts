@@ -8,6 +8,8 @@ export interface IChallengeParticipant {
   score: number;
   value: number; // raw value (e.g. reps) o suma si hay varios ejercicios
   lifts?: { exercise: string; value: number }[];
+  /** Competición SBD: tres intentos por levantamiento. 0 = nulo o no realizado. */
+  attempts?: { squat: number[]; bench: number[]; deadlift: number[] };
   initialValue?: number; // primera marca al unirse (para calcular progreso)
   initialScore?: number;
   /** Puesto (1 = primero) en el momento de meterse. Sirve para ver si has subido o bajado. */
@@ -33,6 +35,10 @@ export interface IChallenge extends Document {
   usePointsSystem: boolean;
   /** Ponderación por peso en reps/seg: más peso = más puntos | menos peso = más puntos | sin ponderar. */
   bodyWeightScoring: BodyWeightScoringMode;
+  /** Torneo de competición: sentadilla, banca y peso muerto, tres intentos cada uno. */
+  meet?: boolean;
+  /** Cuándo se avisó de que quedaban menos de 24 h. */
+  endingSoonNotifiedAt?: Date | null;
   /** Cuándo se enviaron notificaciones de ganador al cerrar el torneo. */
   winnerNotifiedAt?: Date | null;
   participants: IChallengeParticipant[];
@@ -71,6 +77,11 @@ const ChallengeParticipantSchema = new Schema<IChallengeParticipant>({
       },
     ],
     default: undefined,
+  },
+  attempts: {
+    squat: { type: [Number], default: undefined },
+    bench: { type: [Number], default: undefined },
+    deadlift: { type: [Number], default: undefined },
   },
   initialValue: { type: Number },
   initialScore: { type: Number },
@@ -129,6 +140,14 @@ const ChallengeSchema = new Schema<IChallenge>(
       type: String,
       enum: ['heavier_more', 'lighter_more', 'neutral'],
       default: 'heavier_more',
+    },
+    meet: {
+      type: Boolean,
+      default: false,
+    },
+    endingSoonNotifiedAt: {
+      type: Date,
+      default: null,
     },
     winnerNotifiedAt: {
       type: Date,

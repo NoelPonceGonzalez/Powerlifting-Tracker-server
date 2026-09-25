@@ -6,6 +6,8 @@ export type NotificationType =
   | 'challenge_invite'
   | 'challenge_join'
   | 'challenge_winner'
+  | 'challenge_ending'
+  | 'sbd_update'
   | 'friend_accepted'
   | 'new_rm'
   | 'post_like'
@@ -45,6 +47,8 @@ const NotificationSchema = new Schema<INotification>(
         'challenge_invite',
         'challenge_join',
         'challenge_winner',
+        'challenge_ending',
+        'sbd_update',
         'friend_accepted',
         'new_rm',
         'post_like',

@@ -34,6 +34,7 @@ export function formatChallengeDoc(c: any) {
     exercises,
     isPrivate: !!c.isPrivate,
     closeFriendsOnly: !!c.closeFriendsOnly,
+    meet: !!c.meet,
     usePointsSystem: c.usePointsSystem !== false,
     bodyWeightScoring: normalizeBodyWeightScoring(c.bodyWeightScoring),
     createdAt: createdAt ? new Date(createdAt).toISOString() : undefined,
@@ -51,6 +52,13 @@ export function formatChallengeDoc(c: any) {
         score: displayScoreForParticipant(c, p, bodyWeight, gender),
         value: p.value,
         lifts: Array.isArray(p.lifts) ? p.lifts : undefined,
+        attempts: p.attempts && typeof p.attempts === 'object'
+          ? {
+              squat: Array.isArray(p.attempts.squat) ? p.attempts.squat : [],
+              bench: Array.isArray(p.attempts.bench) ? p.attempts.bench : [],
+              deadlift: Array.isArray(p.attempts.deadlift) ? p.attempts.deadlift : [],
+            }
+          : undefined,
         initialValue: p.initialValue,
         initialScore: p.initialScore,
         initialRank: typeof p.initialRank === 'number' ? p.initialRank : undefined,
