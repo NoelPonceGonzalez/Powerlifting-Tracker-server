@@ -77,8 +77,11 @@ router.get('/', authenticateToken, async (req: Request, res: Response) => {
     );
     const visible = challenges.filter(c => {
       const creatorId = String((c.createdBy as any)?._id ?? c.createdBy);
+      const joined = c.participants.some(p => participantUserIdString(p) === String(userId));
+      const ended = c.endDate.getTime() <= now.getTime();
+      if (ended && !joined) return false;
       if (hidden.has(creatorId) && creatorId !== String(userId)) return false;
-      if (c.participants.some(p => participantUserIdString(p) === String(userId))) return true;
+      if (joined) return true;
       if (creatorId === String(userId)) return true;
       if (c.closeFriendsOnly && !(closeByCreator.get(creatorId) || new Set()).has(String(userId))) {
         return false;

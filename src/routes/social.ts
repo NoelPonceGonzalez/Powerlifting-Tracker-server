@@ -965,7 +965,7 @@ router.get('/friends/routine-progress', authenticateToken, async (req: Request, 
  * portada (nombre, bio, contadores) pero no las marcas: eso queda para el círculo cercano.
  */
 
-type ProfileChallenge = { title: string; exercise: string };
+type ProfileChallenge = { title: string; exercise: string; viewerIn: boolean };
 type ProfileGymPlan = { gymName: string; time: string };
 type LivePeek = {
   /** Ellos me siguen: entonces se ven sus torneos y a qué hora van. */
@@ -1172,6 +1172,7 @@ async function liveProfilePeek(viewerId: string, targetId: string): Promise<Live
     visibleChallenges.push({
       title: ch.title,
       exercise: Array.isArray(ch.exercises) && ch.exercises.length ? ch.exercises.join(' · ') : ch.exercise,
+      viewerIn: (ch.participants || []).some(p => String(p.userId) === viewerId),
     });
     if (visibleChallenges.length >= 6) break;
   }
