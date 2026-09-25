@@ -45,6 +45,28 @@ function getIpfGlCoefficients(exercise: string, gender: Gender): IpfGlCoefficien
   return IPF_GL_CLASSIC[gender].total;
 }
 
+/** IPF GL 2020, powerlifting con equipación (total). */
+const IPF_GL_EQUIPPED: Record<Gender, IpfGlCoefficients> = {
+  hombre: { a: 1236.25115, b: 1449.21864, c: 0.01644 },
+  mujer: { a: 758.63878, b: 949.31382, c: 0.02435 },
+};
+
+export function ipfGlPoints(totalKg: number, bodyWeight: number, gender?: Gender): number {
+  const g: Gender = gender === 'mujer' ? 'mujer' : 'hombre';
+  return computeIpfGlPoints(totalKg, bodyWeight, 'powerlifting', g);
+}
+
+/** Puntos GL del total SBD con coeficientes de equipación. */
+export function ipfGlEquippedPoints(totalKg: number, bodyWeight: number, gender?: Gender): number {
+  const g: Gender = gender === 'mujer' ? 'mujer' : 'hombre';
+  const bw = bodyWeight > 0 ? bodyWeight : g === 'mujer' ? 60 : 80;
+  const coeffs = IPF_GL_EQUIPPED[g];
+  const denominator = coeffs.a - coeffs.b * Math.exp(-coeffs.c * bw);
+  if (denominator <= 0) return 0;
+  const coefficient = Math.round((100 / denominator) * 1e6) / 1e6;
+  return Math.round(coefficient * totalKg * 100) / 100;
+}
+
 function computeIpfGlPoints(value: number, bodyWeight: number, exercise: string, gender: Gender): number {
   const bw = bodyWeight > 0 ? bodyWeight : gender === 'mujer' ? 60 : 80;
   const coeffs = getIpfGlCoefficients(exercise, gender);
