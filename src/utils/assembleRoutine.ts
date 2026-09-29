@@ -290,13 +290,18 @@ function inferCycleLengthCl(input: DisassemblePlanInput, rawTemplate: any[]): nu
   return 4;
 }
 
-/** Coloca las semanas recibidas en las posiciones 1…cl del ciclo, rellenando los huecos con la primera. */
+/**
+ * Coloca las semanas en las posiciones 1…cl del ciclo.
+ * Si varias caen en el mismo hueco, se queda la última: es la misma regla que en el cliente
+ * (`deriveBaseTemplateFromWeeks`). Quedarse con la primera hacía que, al guardar las 52 semanas,
+ * sobreviviera la semana 1 y se perdiera la que se estaba editando.
+ */
 function buildTemplateSlots(rawWeeks: any[], cycleLength: number): any[] {
   const cl = Math.max(1, Math.min(52, cycleLength));
   const bySlot = new Map<number, any>();
   for (const tpl of rawWeeks) {
     const slot = Math.min(cl, Math.max(1, Number(tpl.number ?? tpl.slot ?? 1)));
-    if (!bySlot.has(slot)) bySlot.set(slot, { ...tpl, number: slot });
+    bySlot.set(slot, { ...tpl, number: slot });
   }
   return Array.from({ length: cl }, (_, i) => {
     const slot = i + 1;
@@ -308,8 +313,19 @@ function buildTemplateSlots(rawWeeks: any[], cycleLength: number): any[] {
   });
 }
 
+/** Un solo guardado por rutina. Dos PATCH a la vez se pisaban: el lento volvía a escribir el plan viejo. */
+const planWriteTail = new Map<string, Promise<unknown>>();
+
 /** Borra el plan viejo y guarda el nuevo en colecciones normalizadas. */
 export async function disassemblePlanToCollections(input: DisassemblePlanInput) {
+  const key = String(input.routineId);
+  const prev = planWriteTail.get(key) ?? Promise.resolve();
+  const run = prev.then(() => writePlanCollections(input), () => writePlanCollections(input));
+  planWriteTail.set(key, run.then(() => undefined, () => undefined));
+  return run;
+}
+
+async function writePlanCollections(input: DisassemblePlanInput) {
   const { routineId } = input;
   const oldVersions = await ProgramVersion.find({ routineId }).select('_id').lean();
   const oldVIds = oldVersions.map((v) => oid(v._id));
@@ -373,7 +389,7 @@ export async function disassemblePlanToCollections(input: DisassemblePlanInput) 
         const day = days[di];
         const td = await TemplateDay.create({
           templateWeekId: tw._id,
-          dayIndex: di,
+          dayIndex: Number.isFinite(Number(day.dayIndex)) ? Number(day.dayIndex) : di,
           name: day.name || '',
           dayType: day.type || day.dayType || 'workout',
         });
