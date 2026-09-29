@@ -1,4 +1,6 @@
 import express, { Request, Response } from 'express';
+import { request as httpRequest } from 'http';
+import { request as httpsRequest } from 'https';
 import { createReadStream, existsSync, statSync } from 'fs';
 import { extname, join, resolve, sep } from 'path';
 import mongoose from 'mongoose';
@@ -23,6 +25,48 @@ function mediaTokenOk(req: Request): boolean {
 }
 
 const router = express.Router();
+
+/**
+ * En local la base es la de producción, pero las fotos se subieron al disco de ese servidor.
+ * Si aquí no está el archivo, se pide allí y se reenvía tal cual.
+ */
+function proxyMediaFallback(req: Request, res: Response): Promise<boolean> {
+  const base = (process.env.MEDIA_FALLBACK_ORIGIN || '').trim().replace(/\/$/, '');
+  if (!base) return Promise.resolve(false);
+  let target: URL;
+  try {
+    target = new URL(req.originalUrl, `${base}/`);
+  } catch {
+    return Promise.resolve(false);
+  }
+  if (target.host === (req.get('host') || '')) return Promise.resolve(false);
+  const send = target.protocol === 'https:' ? httpsRequest : httpRequest;
+  return new Promise(resolveOk => {
+    const upstream = send(target, { method: 'GET', timeout: 8000 }, up => {
+      const code = up.statusCode || 0;
+      const type = String(up.headers['content-type'] || '');
+      if (code < 200 || code >= 300 || /text\/html|application\/json/i.test(type)) {
+        up.resume();
+        resolveOk(false);
+        return;
+      }
+      res.status(code);
+      if (type) res.setHeader('Content-Type', type);
+      const len = up.headers['content-length'];
+      if (len) res.setHeader('Content-Length', String(len));
+      res.setHeader('Cache-Control', 'private, max-age=300');
+      res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+      up.pipe(res);
+      resolveOk(true);
+    });
+    upstream.on('error', () => resolveOk(false));
+    upstream.on('timeout', () => {
+      upstream.destroy();
+      resolveOk(false);
+    });
+    upstream.end();
+  });
+}
 
 const DATA_RE = /^data:(image\/(?:jpeg|jpg|png|webp|gif));base64,([a-z0-9+/=\s]+)$/i;
 
@@ -80,6 +124,7 @@ router.get('/user/:userId', async (req: Request, res: Response) => {
       }
       const direct = await storage.publicUrl(key);
       if (direct) return res.redirect(302, direct);
+      if (await proxyMediaFallback(req, res)) return;
       res.setHeader('Cache-Control', 'no-store');
       return res.status(404).end();
     }
@@ -140,7 +185,10 @@ router.get('/:folder/:file', async (req: Request, res: Response) => {
     }
 
     const found = await storage.read(key);
-    if (!found) return res.status(404).json({ error: 'Archivo no encontrado' });
+    if (!found) {
+      if (await proxyMediaFallback(req, res)) return;
+      return res.status(404).json({ error: 'Archivo no encontrado' });
+    }
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('Content-Length', String(found.size));
     res.setHeader('Content-Type', found.mimeType);

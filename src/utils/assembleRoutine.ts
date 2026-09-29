@@ -351,9 +351,16 @@ async function writePlanCollections(input: DisassemblePlanInput) {
   const templateSource = buildTemplateSlots(rawTemplate, cl);
   if (templateSource.length === 0) return;
 
-  const effectiveVersions = input.versions?.length
+  const incomingVersions = input.versions?.length
     ? input.versions
     : [{ effectiveFromWeek: 1 }];
+  const versionByStart = new Map<number, (typeof incomingVersions)[number]>();
+  for (const cv of incomingVersions) {
+    versionByStart.set(cv.effectiveFromWeek ?? 1, cv);
+  }
+  const effectiveVersions = [...versionByStart.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([, cv]) => cv);
 
   
   for (let vi = 0; vi < effectiveVersions.length; vi++) {
