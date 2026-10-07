@@ -55,7 +55,7 @@ function buildPushDataPayload(data?: Record<string, any>): Record<string, string
   } else if (type === 'gym_checkin' || type === 'same_time_confirmation') {
     screen = 'social';
     tab = 'checkins';
-  } else if (type === 'chat_message') {
+  } else if (type === 'chat_message' || type === 'chat_mention' || type === 'story_tag' || type === 'comment_mention') {
     screen = 'social';
     tab = 'chat';
   } else if (

@@ -19,8 +19,20 @@ import { blockBetween, blockedIdsFor, canSeeCloseAudience } from '../utils/priva
 import { broadcastSse } from '../utils/sse';
 import { chatIsOpen, ensurePendingChatRequest } from '../utils/chatAccess';
 import { publicListAvatar } from '../utils/avatarMedia';
+import { notifyUsers } from '../utils/notify';
+import { parseMentionIds, serializeMentions, snapshotMentions, taggableIds } from '../utils/mentions';
 
 const router = express.Router();
+
+function isTagged(post: { tags?: { userId?: unknown }[] | null }, userId: string): boolean {
+  return (post.tags || []).some(t => String(t?.userId) === String(userId));
+}
+
+/** Seguir al autor o estar etiquetado en la publicación. */
+async function canSeePost(viewerId: string, post: { userId: unknown; tags?: { userId?: unknown }[] | null }) {
+  if (isTagged(post, viewerId)) return (await blockBetween(String(viewerId), String(post.userId))) === 'none';
+  return canSeeContent(viewerId, String(post.userId));
+}
 
 /** Los vídeos cortos de una serie caben de sobra en 80 MB; se lee en memoria y se vuelca al almacén. */
 const upload = multer({
@@ -59,6 +71,7 @@ function serializePost(post: any, viewerId: string) {
     createdAt: post.createdAt,
     expiresAt: post.expiresAt ?? null,
     author: authorOf(post.userId),
+    tags: serializeMentions(post.tags),
     mine,
     // Quién ha visto o dado like solo se le enseña a su autor (tú no sales en tu lista).
     ...(mine && post.kind === 'story'
@@ -93,6 +106,8 @@ router.post(
       const kind = String(req.body.kind || 'story') === 'post' ? 'post' : 'story';
       const caption = String(req.body.caption || '').trim().slice(0, 2200);
       const audience = String(req.body.audience || 'all') === 'close' ? 'close' : 'all';
+      const tagIds = parseMentionIds(req.body.tags);
+      const tags = tagIds.length ? await snapshotMentions(tagIds, await taggableIds(userId), String(userId)) : [];
       const stored = await mediaStorage().save(file.buffer, mime);
 
       const post = await Post.create({
@@ -103,6 +118,7 @@ router.post(
         mimeType: stored.mimeType,
         caption,
         audience,
+        tags,
         likes: [],
         commentCount: 0,
         ...(kind === 'story' ? { expiresAt: new Date(Date.now() + STORY_LIFETIME_MS) } : {}),
@@ -110,6 +126,19 @@ router.post(
 
       const author = await User.findById(userId).select('name avatar').lean();
       res.status(201).json(serializePost({ ...post.toObject(), userId: author }, userId));
+
+      if (tags.length) {
+        const name = author?.name || 'Alguien';
+        void notifyUsers({
+          userIds: tags.map(t => String(t.userId)),
+          type: 'story_tag',
+          title: 'Te han etiquetado',
+          message: kind === 'story' ? `${name} te ha etiquetado en su historia` : `${name} te ha etiquetado en una publicación`,
+          relatedUserId: String(userId),
+          relatedData: { postId: String(post._id), kind },
+          sse: 'social_update',
+        }).catch(e => console.error('[TAG] story_tag:', e));
+      }
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }
@@ -147,7 +176,7 @@ router.get('/stories', authenticateToken, async (req: Request, res: Response) =>
   try {
     const userId = (req as any).user.userId;
     const stories = await Post.find({
-      userId: { $in: await circleIds(userId) },
+      $or: [{ userId: { $in: await circleIds(userId) } }, { 'tags.userId': toObjectId(userId) }],
       kind: 'story',
       expiresAt: { $gt: new Date() },
     })
@@ -166,6 +195,7 @@ router.get('/stories', authenticateToken, async (req: Request, res: Response) =>
     const visibleStories = stories.filter(s => {
       const uid = String((s.userId as any)?._id ?? s.userId);
       if (hidden.has(uid) && uid !== String(userId)) return false;
+      if (isTagged(s, String(userId))) return true;
       const close = new Set((authorById.get(uid)?.closeFriendIds || []).map((id: unknown) => String(id)));
       return canSeeCloseAudience(String(userId), uid, (s as any).audience, close);
     });
@@ -221,13 +251,13 @@ router.get('/users/:userId/posts', authenticateToken, async (req: Request, res: 
 router.post('/posts/:id/view', authenticateToken, async (req: Request, res: Response) => {
   try {
     const userId = (req as any).user.userId;
-    const post = await Post.findById(req.params.id).select('userId kind').lean();
+    const post = await Post.findById(req.params.id).select('userId kind tags').lean();
     if (!post) return res.status(404).json({ error: 'Publicación no encontrada' });
     if (String(post.userId) === String(userId)) {
       await Post.updateOne({ _id: post._id }, { $addToSet: { views: toObjectId(userId) } });
       return res.json({ ok: true });
     }
-    if (!(await canSeeContent(userId, String(post.userId)))) {
+    if (!(await canSeePost(userId, post))) {
       return res.status(403).json({ error: 'No puedes ver esta historia' });
     }
 
@@ -244,7 +274,7 @@ router.post('/posts/:id/like', authenticateToken, async (req: Request, res: Resp
     const userId = (req as any).user.userId;
     const post = await Post.findById(req.params.id);
     if (!post) return res.status(404).json({ error: 'Publicación no encontrada' });
-    if (!(await canSeeContent(userId, String(post.userId)))) {
+    if (!(await canSeePost(userId, post))) {
       return res.status(403).json({ error: 'No puedes interactuar con esta publicación' });
     }
 
@@ -311,9 +341,9 @@ router.post('/posts/:id/like', authenticateToken, async (req: Request, res: Resp
 router.get('/posts/:id/comments', authenticateToken, async (req: Request, res: Response) => {
   try {
     const userId = (req as any).user.userId;
-    const post = await Post.findById(req.params.id).select('userId').lean();
+    const post = await Post.findById(req.params.id).select('userId tags').lean();
     if (!post) return res.status(404).json({ error: 'Publicación no encontrada' });
-    if (!(await canSeeContent(userId, String(post.userId)))) {
+    if (!(await canSeePost(userId, post))) {
       return res.status(403).json({ error: 'No puedes ver estos comentarios' });
     }
 
@@ -326,6 +356,7 @@ router.get('/posts/:id/comments', authenticateToken, async (req: Request, res: R
       comments: comments.map((c: any) => ({
         id: String(c._id),
         text: c.text,
+        mentions: serializeMentions(c.mentions),
         createdAt: c.createdAt,
         author: authorOf(c.userId),
         mine: String(c.userId?._id ?? c.userId) === String(userId),
@@ -348,15 +379,27 @@ router.post(
       const userId = (req as any).user.userId;
       const post = await Post.findById(req.params.id);
       if (!post) return res.status(404).json({ error: 'Publicación no encontrada' });
-      if (!(await canSeeContent(userId, String(post.userId)))) {
+      if (!(await canSeePost(userId, post))) {
         return res.status(403).json({ error: 'No puedes comentar esta publicación' });
       }
 
+      const text = String(req.body.text).trim().slice(0, 1000);
+      const askedMentions = parseMentionIds(req.body.mentions);
+      let mentions: Awaited<ReturnType<typeof snapshotMentions>> = [];
+      if (askedMentions.length) {
+        const allowed = await taggableIds(userId);
+        allowed.add(String(post.userId));
+        mentions = await snapshotMentions(askedMentions, allowed, String(userId));
+        const visible = await Promise.all(mentions.map(m => canSeePost(String(m.userId), post)));
+        mentions = mentions.filter((m, i) => visible[i] && text.includes(`@${m.name}`));
+      }
       const created = await PostComment.create({
         postId: post._id,
         userId: toObjectId(userId),
-        text: String(req.body.text).trim().slice(0, 1000),
+        text,
+        mentions,
       });
+      const mentionedIds = new Set(mentions.map(m => String(m.userId)));
       post.commentCount = (post.commentCount ?? 0) + 1;
       await post.save();
 
@@ -429,10 +472,24 @@ router.post(
           await ensurePendingChatRequest(userId, ownerId, created.text);
         }
       }
-      const otherCommenters = await PostComment.distinct('userId', {
-        postId: post._id,
-        userId: { $nin: [toObjectId(userId), post.userId] },
-      });
+      const mentionTargets = [...mentionedIds].filter(id => id !== ownerId);
+      if (mentionTargets.length) {
+        void notifyUsers({
+          userIds: mentionTargets,
+          type: 'comment_mention',
+          title: 'Te han mencionado',
+          message: `${me?.name || 'Alguien'} te ha mencionado: ${created.text.slice(0, 80)}`,
+          relatedUserId: String(userId),
+          relatedData: { postId: String(post._id), kind: post.kind },
+          sse: 'social_update',
+        }).catch(e => console.error('[TAG] comment_mention:', e));
+      }
+      const otherCommenters = (
+        await PostComment.distinct('userId', {
+          postId: post._id,
+          userId: { $nin: [toObjectId(userId), post.userId] },
+        })
+      ).filter(id => !mentionedIds.has(String(id)));
       if (otherCommenters.length > 0) {
         const replyTitle = 'Respuesta a tu comentario';
         const replyMessage = `${me?.name || 'Alguien'} ha respondido: ${created.text.slice(0, 80)}`;
@@ -465,6 +522,7 @@ router.post(
       res.status(201).json({
         id: String(created._id),
         text: created.text,
+        mentions: serializeMentions(created.mentions),
         createdAt: created.createdAt,
         author: authorOf({ _id: userId, ...me }),
         mine: true,

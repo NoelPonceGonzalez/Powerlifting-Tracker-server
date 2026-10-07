@@ -20,6 +20,8 @@ export interface IChatMessage extends Document {
     mediaType: 'image' | 'video';
     caption?: string;
   } | null;
+  /** Solo grupos: miembros mencionados con @. */
+  mentions?: { userId: mongoose.Types.ObjectId; name: string }[];
   createdAt: Date;
   updatedAt: Date;
 }
@@ -43,6 +45,10 @@ const ChatMessageSchema = new Schema<IChatMessage>(
         caption: { type: String },
       },
       default: null,
+    },
+    mentions: {
+      type: [{ _id: false, userId: { type: Schema.Types.ObjectId, ref: 'User' }, name: String }],
+      default: undefined,
     },
   },
   { timestamps: true }

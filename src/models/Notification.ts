@@ -18,6 +18,9 @@ export type NotificationType =
   | 'chat_request'
   | 'chat_message'
   | 'post_comment_reply'
+  | 'story_tag'
+  | 'comment_mention'
+  | 'chat_mention'
   | 'workout_reminder';
 
 export interface INotification extends Document {
@@ -59,6 +62,9 @@ const NotificationSchema = new Schema<INotification>(
         'chat_request',
         'chat_message',
         'post_comment_reply',
+        'story_tag',
+        'comment_mention',
+        'chat_mention',
         'workout_reminder',
       ],
       required: true,

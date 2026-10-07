@@ -33,6 +33,8 @@ import { Challenge } from '../models/Challenge';
 import { GymCheckIn } from '../models/GymCheckIn';
 import { chatIsOpen, ensurePendingChatRequest, haveSharedChat, wipeDmBothSides } from '../utils/chatAccess';
 import { publicListAvatar } from '../utils/avatarMedia';
+import { notifyUsers } from '../utils/notify';
+import { parseMentionIds, serializeMentions, snapshotMentions } from '../utils/mentions';
 
 const router = express.Router();
 
@@ -1681,6 +1683,7 @@ function serializeChatLine(
     readBy?: unknown[];
     createdAt: Date;
     storyReply?: StoryReplySnap;
+    mentions?: unknown;
   },
   me: string,
   author?: ReturnType<typeof authorCard>,
@@ -1696,6 +1699,7 @@ function serializeChatLine(
   return {
     id: String(row._id),
     text: row.text || '',
+    mentions: serializeMentions(row.mentions),
     storyReply: showStory
       ? {
           postId: reply?.postId || '',
@@ -2430,17 +2434,33 @@ router.post('/chats/groups/:groupId/messages', authenticateToken, optionalChatFi
     if (!group || !isGroupMember(group, me)) return res.status(404).json({ error: 'Grupo no encontrado' });
 
     const meUser = await User.findById(me).select('name avatar').lean();
+    const others = group.members.map(id => String(id)).filter(id => id !== me);
+    const askedMentions = parseMentionIds(req.body?.mentions);
+    const mentions = askedMentions.length
+      ? (await snapshotMentions(askedMentions, new Set(others), me)).filter(m => text.includes(`@${m.name}`))
+      : [];
     const created = await ChatMessage.create({
       from: me,
       groupId,
       text,
       ...chatAttachmentFields(media),
       readBy: [me],
+      ...(mentions.length ? { mentions } : {}),
     });
     const line = serializeChatLine(created, me, meUser ? authorCard(meUser) : { id: me, name: 'Tú', avatar: null, online: true });
-    const others = group.members.map(id => String(id)).filter(id => id !== me);
     broadcastSse(others, 'chat_message', { message: { ...line, mine: false }, groupId });
-    void notifyChatMessage({ toIds: others, fromId: me, preview: text, groupId });
+    const mentionedIds = new Set(mentions.map(m => String(m.userId)));
+    if (mentionedIds.size) {
+      void notifyUsers({
+        userIds: [...mentionedIds],
+        type: 'chat_mention',
+        title: `${meUser?.name || 'Alguien'} te ha mencionado`,
+        message: `En ${group.name || 'el grupo'}: ${text.slice(0, 80)}`,
+        relatedUserId: me,
+        relatedData: { groupId, peerId: me },
+      }).catch(e => console.error('[TAG] chat_mention:', e));
+    }
+    void notifyChatMessage({ toIds: others.filter(id => !mentionedIds.has(id)), fromId: me, preview: text, groupId });
     res.status(201).json(line);
   } catch (error: any) {
     res.status(500).json({ error: error.message });

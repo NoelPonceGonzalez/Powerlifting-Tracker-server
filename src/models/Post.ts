@@ -17,6 +17,8 @@ export interface IPost extends Document {
   commentCount: number;
   /** all = quien te sigue; close = solo mejores amigos. */
   audience?: 'all' | 'close';
+  /** Amigos etiquetados en la historia: la pueden ver aunque no sigan al autor. */
+  tags?: { userId: mongoose.Types.ObjectId; name: string }[];
   /** Solo historias: Mongo las borra sola a las 24 h. */
   expiresAt?: Date;
   createdAt: Date;
@@ -35,6 +37,10 @@ const PostSchema = new Schema<IPost>(
     views: [{ type: Schema.Types.ObjectId, ref: 'User' }],
     commentCount: { type: Number, default: 0 },
     audience: { type: String, enum: ['all', 'close'], default: 'all' },
+    tags: {
+      type: [{ _id: false, userId: { type: Schema.Types.ObjectId, ref: 'User' }, name: String }],
+      default: [],
+    },
     expiresAt: { type: Date },
   },
   { timestamps: true }
@@ -42,6 +48,7 @@ const PostSchema = new Schema<IPost>(
 
 PostSchema.index({ kind: 1, createdAt: -1 });
 PostSchema.index({ userId: 1, createdAt: -1 });
+PostSchema.index({ 'tags.userId': 1, kind: 1, expiresAt: 1 });
 /**
  * TTL de seguridad con margen: la barrida de `storyCleanup` borra antes el archivo del
  * almacén y luego el documento. Si algo fallara, Mongo se lleva el documento igualmente.
