@@ -13,14 +13,12 @@ export function parseMentionIds(raw: unknown): string[] {
   if (Array.isArray(raw)) list = raw;
   else if (typeof raw === 'string' && raw.trim()) {
     const s = raw.trim();
-    if (s.startsWith('[')) {
-      try {
-        const parsed = JSON.parse(s);
-        if (Array.isArray(parsed)) list = parsed;
-      } catch {
-        list = [];
-      }
-    } else list = s.split(',');
+    try {
+      const parsed = s.startsWith('[') ? JSON.parse(s) : null;
+      list = Array.isArray(parsed) ? parsed : s.replace(/[[\]"'\s]/g, '').split(',');
+    } catch {
+      list = s.replace(/[[\]"'\s]/g, '').split(',');
+    }
   }
   const ids = list.map(v => String(v ?? '').trim()).filter(id => mongoose.isValidObjectId(id));
   return [...new Set(ids)].slice(0, MAX_MENTIONS);
